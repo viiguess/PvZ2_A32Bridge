@@ -9,9 +9,8 @@ project(a32bridge LANGUAGES C CXX)
 #         -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DLIBNAME=Game
 
 set(LIBNAME Game CACHE STRING "Name of the game library to stand in for (produces lib<LIBNAME>.so)")
-set(ORIG_SIG_HASH "" CACHE STRING
-    "Signature.hashCode() of the original APK signer. Answered when the game checks its own signature, which \
-changes when the APK is re-signed.")
+set(ORIG_SIG_HASH "500290098" CACHE STRING
+    "Signature.hashCode() of the original APK signer, returned when the game checks its own signature (default: PopCap/EA). Empty disables.")
 option(A32_LOG "Log translator messages and the game's own log/stdio output to logcat" OFF)
 option(A32_TRACE "Also log every guest->host stub and JNI call (very verbose)" OFF)
 set(A32_DYNARMIC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dynarmic" CACHE PATH "Dynarmic source tree (git submodule)")

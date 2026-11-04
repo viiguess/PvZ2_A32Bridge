@@ -9,9 +9,15 @@ What it does:
   1. lib/arm64-v8a/lib<name>.so      the bridge (the file name chooses <name>, which must match the library the
                                      game loads with System.loadLibrary("<name>"))
      lib/arm64-v8a/lib<name>_a32.so  the game's original armeabi/armeabi-v7a library, which the bridge loads
-  2. Removes the other 32-bit libraries: they cannot be loaded into a 64-bit process. Their System.loadLibrary
-     calls are redirected to "<name>" (loading an already-loaded library is a no-op), so the Java side still starts.
-     Natives of those libraries are NOT available; code that calls them throws UnsatisfiedLinkError when reached.
+  2. Keeps the 32-bit libraries under lib/armeabi{,-v7a}, so the same APK also installs natively on 32-bit ARM
+     devices (Android picks arm64-v8a on 64-bit devices, armeabi on 32-bit ones). With --arm64-only they are removed.
+     Other 32-bit SDK libraries cannot be loaded into a 64-bit process, so their System.loadLibrary calls are
+     redirected to "<name>" (loading an already-loaded library is a no-op) and the Java side still starts. Natives of
+     those libraries are NOT available (on 32-bit devices too, because the redirect is in the Java code); code that
+     calls them throws UnsatisfiedLinkError when reached.
+  2b. Signature checks are answered by the bridge (ORIG_SIG_HASH, default: the PopCap/EA certificate), so the game
+     library is left unmodified. The real hash is read from the APK's original signature and reported; if it differs
+     from the bridge's default, rebuild the bridge with -DORIG_SIG_HASH=<value>.
   3. Raises minSdk/targetSdk to values arm64 devices accept, keeps scoped storage off for old games, and removes
      android:debuggable.
   4. With --pin-intents, pins implicit service intents in the given smali files to the app's own package (Android 5+
@@ -43,7 +49,53 @@ def smali_files(root):
                 yield os.path.join(base, name)
 
 
-def install_libraries(out, bridge, name):
+DEFAULT_SIG_HASH = 500290098  # CMakeLists.txt default: the PopCap/EA signing certificate
+
+
+def der_item(data, pos):
+    """Returns (tag, start_of_content, end) of the DER element at `pos`."""
+    tag = data[pos]
+    length = data[pos + 1]
+    pos += 2
+    if length & 0x80:
+        count = length & 0x7f
+        length = int.from_bytes(data[pos:pos + count], 'big')
+        pos += count
+    return tag, pos, pos + length
+
+
+def original_signature_hash(decoded):
+    """Java's Signature.hashCode() for the first signer certificate of the original APK, or None."""
+    meta = os.path.join(decoded, 'original', 'META-INF')
+    if not os.path.isdir(meta):
+        return None
+    for name in sorted(os.listdir(meta)):
+        if not name.upper().endswith(('.RSA', '.DSA', '.EC')):
+            continue
+        with open(os.path.join(meta, name), 'rb') as f:
+            data = f.read()
+        try:  # PKCS#7: ContentInfo { oid, [0] SignedData { version, digestAlgs, contentInfo, [0] certificates ... } }
+            _, start, _ = der_item(data, 0)
+            _, start, _ = der_item(data, der_item(data, start)[2])      # skip the OID, enter [0]
+            _, start, _ = der_item(data, start)                          # enter SignedData
+            pos = start
+            for _ in range(3):                                           # version, digestAlgorithms, contentInfo
+                pos = der_item(data, pos)[2]
+            tag, start, _ = der_item(data, pos)                          # [0] certificates
+            if tag != 0xa0:
+                continue
+            _, _, end = der_item(data, start)
+            cert = data[start:end]
+        except IndexError:
+            continue
+        h = 1
+        for b in cert:  # java.util.Arrays.hashCode(byte[])
+            h = (31 * h + (b - 256 if b > 127 else b)) & 0xffffffff
+        return h - (1 << 32) if h > 0x7fffffff else h
+    return None
+
+
+def install_libraries(out, bridge, name, keep_32bit=True):
     lib = os.path.join(out, 'lib')
     arm64 = os.path.join(lib, 'arm64-v8a')
     os.makedirs(arm64, exist_ok=True)
@@ -57,8 +109,9 @@ def install_libraries(out, bridge, name):
         sys.exit('no lib%s.so found under lib/armeabi{,-v7a}' % name)
     shutil.copy(bridge, os.path.join(arm64, 'lib%s.so' % name))
     shutil.copy(original, os.path.join(arm64, 'lib%s_a32.so' % name))
-    for abi in ('armeabi', 'armeabi-v7a'):
-        shutil.rmtree(os.path.join(lib, abi), ignore_errors=True)
+    if not keep_32bit:
+        for abi in ('armeabi', 'armeabi-v7a'):
+            shutil.rmtree(os.path.join(lib, abi), ignore_errors=True)
 
 
 LOAD_LIBRARY = re.compile(
@@ -156,6 +209,8 @@ def main():
     parser.add_argument('--package', help="app package for service-intent pinning (default: from the manifest)")
     parser.add_argument('--pin-intents', nargs='*', default=[], metavar='SMALI',
                         help='smali files (relative to smali/) whose implicit service intents are pinned to the app')
+    parser.add_argument('--arm64-only', action='store_true',
+                        help='drop the 32-bit libraries (default: keep them so the APK also runs natively on 32-bit ARM)')
     args = parser.parse_args()
 
     base = os.path.basename(args.bridge)
@@ -164,7 +219,16 @@ def main():
     name = base[3:-3]
 
     shutil.copytree(args.decoded, args.out, ignore=shutil.ignore_patterns('_backup'), dirs_exist_ok=True)
-    install_libraries(args.out, args.bridge, name)
+    sig = original_signature_hash(args.decoded)
+    if sig is None:
+        print('original signature hash: not found (no original/META-INF in the decoded APK)')
+    elif sig == DEFAULT_SIG_HASH:
+        print('original signature hash: %d (matches the bridge default)' % sig)
+    else:
+        print('WARNING: original signature hash is %d, not the bridge default %d.\n'
+              '         Rebuild the bridge with -DORIG_SIG_HASH=%d or the game will report a modified APK.'
+              % (sig, DEFAULT_SIG_HASH, sig))
+    install_libraries(args.out, args.bridge, name, keep_32bit=not args.arm64_only)
     print('loadLibrary calls redirected to "%s": %d' % (name, redirect_load_library(args.out, name)))
     patch_apktool_yml(args.out)
     package = args.package or patch_manifest(args.out)

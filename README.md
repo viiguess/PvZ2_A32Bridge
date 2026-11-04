@@ -84,7 +84,7 @@ Options:
 | Option | Meaning |
 | --- | --- |
 | `LIBNAME` | Name of the game library to stand in for (`libGame.so`). Must match `System.loadLibrary("Game")` |
-| `ORIG_SIG_HASH` | Value returned for `Signature.hashCode()` (see above) |
+| `ORIG_SIG_HASH` | Value returned for `Signature.hashCode()` (see above). Default `500290098` (PopCap/EA); empty disables |
 | `A32_LOG` | Log translator messages and the game's own log/stdio output to logcat (tag `a32`) |
 | `A32_TRACE` | Additionally log every stub and JNI call (very verbose) |
 | `A32_DYNARMIC_DIR`, `A32_BOOST_DIR` | Locations of the third-party sources (defaults: `third_party/...`) |
@@ -97,8 +97,12 @@ Options:
    ```sh
    python tools/port_apk.py decoded build/lib<name>.so ported
    ```
-   This installs `lib<name>.so` (the bridge) and `lib<name>_a32.so` (the original) under `lib/arm64-v8a`, drops the other
-   32-bit libraries, redirects their `System.loadLibrary` calls, and adjusts SDK levels and the manifest. Read its
+   This installs `lib<name>.so` (the bridge) and `lib<name>_a32.so` (the original) under `lib/arm64-v8a`, **keeps the
+   original 32-bit libraries** so the same APK also runs natively on 32-bit ARM devices (`--arm64-only` drops them),
+   redirects the other libraries' `System.loadLibrary` calls, and adjusts SDK levels and the manifest. Signature
+   checks are answered by the bridge itself (`ORIG_SIG_HASH`, which defaults to the PopCap/EA certificate hash
+   `500290098` shared by every PvZ2 build), so the game library stays unmodified. The script reads the real hash from the
+   APK's original signature and warns if it differs; then rebuild the bridge with `-DORIG_SIG_HASH=<value>`. Read its
    output: it lists implicit service intents that Android 5+ rejects; pin the ones that belong to the app with
    `--pin-intents`.
 4. `apktool b ported -o game.apk`, then `zipalign` and sign it.
