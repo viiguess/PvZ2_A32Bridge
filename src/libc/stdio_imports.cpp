@@ -133,8 +133,14 @@ static void import_statfs(Ctx& ctx, const Stub&) {
   ctx.ret(result);
 }
 
+const char* (*g_path_hook)(const char*) = nullptr;
+
+static const char* host_path(const char* guest_path) {
+  return g_path_hook ? g_path_hook(guest_path) : guest_path;
+}
+
 static void import_open(Ctx& ctx, const Stub&) {
-  int result = open((const char*)ctx.p(0), open_flags_from_guest(ctx.a(1)), ctx.a(2));
+  int result = open(host_path((const char*)ctx.p(0)), open_flags_from_guest(ctx.a(1)), ctx.a(2));
   set_errno();
   ctx.ret(result);
 }
@@ -165,13 +171,17 @@ static void import_select(Ctx& ctx, const Stub&) {
 }
 
 static void import_fsetpos(Ctx& ctx, const Stub&) {
+#ifdef A32_HOST_RUNNER  // glibc's fpos_t is a struct; bionic's is the offset
+  ctx.ret(fseek(file_host(ctx.a(0)), *(int32_t*)ctx.p(1), SEEK_SET));
+#else
   fpos_t position = *(int32_t*)ctx.p(1);
   ctx.ret(fsetpos(file_host(ctx.a(0)), &position));
+#endif
 }
 
 // FILE and dir
 static void import_fopen(Ctx& ctx, const Stub&) {
-  FILE* file = fopen((const char*)ctx.p(0), (const char*)ctx.p(1));
+  FILE* file = fopen(host_path((const char*)ctx.p(0)), (const char*)ctx.p(1));
   set_errno();
   ctx.ret(file_new(file));
 }
@@ -374,7 +384,7 @@ static void import_vsscanf(Ctx& ctx, const Stub&) {
 }
 
 static void import_opendir(Ctx& ctx, const Stub&) {
-  DIR* dir = opendir((const char*)ctx.p(0));
+  DIR* dir = opendir(host_path((const char*)ctx.p(0)));
   set_errno();
   if (!dir) {
     ctx.ret(0);
@@ -464,7 +474,11 @@ void register_stdio_imports() {
   // logging
   hle("__android_log_print", import_android_log_print);
   hle("__android_log_assert", import_android_log_assert);
-#ifdef A32_LOG
+#if defined(A32_HOST_RUNNER)  // the host has no liblog: use the shim in tools/jiagu_run/shim
+  hle("__android_log_write", [](Ctx& ctx, const Stub&) {
+    ctx.ret(__android_log_write(ctx.a(0), (const char*)ctx.p(1), (const char*)ctx.p(2)));
+  });
+#elif defined(A32_LOG)
   gen("__android_log_write", "ipp>i", "liblog.so");
 #else
   hle("__android_log_write", [](Ctx& ctx, const Stub&) { ctx.ret(1); });

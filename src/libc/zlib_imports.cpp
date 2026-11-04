@@ -68,6 +68,14 @@ static void zlib_op(Ctx& ctx, const Stub&) {
     stream = z_get(guest_strm, true);
     result = deflateInit(stream, (int)ctx.a(1));
     z_out(guest_strm, stream);
+  } else if (OP == 9) {  // inflateInit2_(strm, windowBits, version, size)
+    stream = z_get(guest_strm, true);
+    result = inflateInit2(stream, (int)ctx.a(1));
+    z_out(guest_strm, stream);
+  } else if (OP == 10) {  // deflateBound(strm, sourceLen)
+    stream = z_get(guest_strm, false);
+    ctx.ret(stream ? (u32)deflateBound(stream, ctx.a(1)) : ctx.a(1) + (ctx.a(1) >> 12) + (ctx.a(1) >> 14) + 13);
+    return;
   } else if (OP == 1) {  // deflateInit2_(strm, level, method, wbits, memlevel, strategy, version, size)
     stream = z_get(guest_strm, true);
     result = deflateInit2(stream, ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5));
@@ -128,6 +136,8 @@ static void import_uncompress(Ctx& ctx, const Stub&) {
 void register_zlib_imports() {
   hle("inflateInit_", zlib_op<0>);
   hle("deflateInit2_", zlib_op<1>);
+  hle("inflateInit2_", zlib_op<9>);
+  hle("deflateBound", zlib_op<10>);
   hle("inflate", zlib_op<2>);
   hle("inflateEnd", zlib_op<3>);
   hle("inflateReset", zlib_op<4>);

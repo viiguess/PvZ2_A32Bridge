@@ -12,6 +12,7 @@
 #include "jni/handles.h"
 #include "libc/libc.h"
 #include "opensles.h"
+#include "runtime/live_patch.h"
 
 // A JNIEnv is a pointer to a table of 235 function pointers; unimplemented slots log when called.
 static constexpr int JNI_TABLE_SIZE = 235;
@@ -66,6 +67,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
   if (!load_elf(path.c_str(), g_main))
     return JNI_ERR;
   LOG("elf loaded, %zu init fns", g_main.init.size());
+  apply_live_patches(g_main);
   for (u32 constructor : g_main.init)
     guest_callv(constructor, nullptr, 0, nullptr);
 

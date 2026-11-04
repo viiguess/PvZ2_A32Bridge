@@ -24,6 +24,11 @@ What it does:
      throws "Service Intent must be explicit"). Candidates are listed; pin only services that belong to the app itself,
      never ones that live in another package (for example Google Play billing).
   5. Fixes style parents that apktool decodes as attribute references and that aapt2 then rejects.
+  6. Stubs the native methods of SDK classes (payment, analytics, ...): their 32-bit libraries cannot be loaded, and
+     calling them would otherwise throw UnsatisfiedLinkError, often on a worker thread. The game's own classes
+     (com/popcap), and the packer stub (com/stub, com/qihoo), keep theirs.
+  7. Guards TelephonyManager.getDeviceId / getImei / getSubscriberId / getSimSerialNumber / getMeid / getLine1Number,
+     which throw SecurityException on Android 10+, so that SDKs calling them at start-up do not crash.
 """
 import argparse
 import os
@@ -191,6 +196,114 @@ def pin_service_intents(out, package, files):
     return changed
 
 
+# ---- telephony identifiers -------------------------------------------------------------------------------------------
+# On Android 10+ these TelephonyManager calls throw SecurityException for ordinary apps, and old payment / analytics SDKs
+# call them unguarded (often in Application.onCreate, which kills the app at start-up). Every call is routed through a
+# generated helper class that catches the exception and returns null, which is what a device without a SIM reports.
+TELEPHONY = 'Landroid/telephony/TelephonyManager;'
+SAFE_IDS_CLASS = 'com/a32/SafeIds'
+GUARDED_TELEPHONY = {  # TelephonyManager method -> name of the helper
+    'getSimSerialNumber': 'iccid',
+    'getSubscriberId': 'imsi',
+    'getDeviceId': 'deviceId',
+    'getImei': 'imei',
+    'getMeid': 'meid',
+    'getLine1Number': 'line1',
+}
+TELEPHONY_CALL = re.compile(
+    r'invoke-virtual \{([^}]*)\}, %s->(%s)\((I?)\)Ljava/lang/String;' % (TELEPHONY, '|'.join(GUARDED_TELEPHONY)))
+
+SAFE_IDS_METHOD = '''\
+.method public static {helper}(L{tm};{param})Ljava/lang/String;
+    .locals 1
+    :try_start
+    invoke-virtual {{{regs}}}, L{tm};->{method}({param})Ljava/lang/String;
+    move-result-object v0
+    :try_end
+    .catch Ljava/lang/Throwable; {{:try_start .. :try_end}} :handler
+    return-object v0
+    :handler
+    const/4 v0, 0x0
+    return-object v0
+.end method
+'''
+
+
+def safe_ids_method(method, with_slot):
+    return SAFE_IDS_METHOD.format(
+        helper=GUARDED_TELEPHONY[method] + ('Slot' if with_slot else ''), tm=TELEPHONY[1:-1], method=method,
+        param='I' if with_slot else '', regs='p0, p1' if with_slot else 'p0')
+
+
+def guard_identifier_calls(out):
+    """Rewrites the calls and adds the helper class. Returns the number of calls rewritten."""
+    used = set()  # (method, with_slot) pairs that need a helper
+
+    def rewrite(m):
+        used.add((m.group(2), bool(m.group(3))))
+        return 'invoke-static {%s}, L%s;->%s%s(L%s;%s)Ljava/lang/String;' % (
+            m.group(1), SAFE_IDS_CLASS, GUARDED_TELEPHONY[m.group(2)], 'Slot' if m.group(3) else '',
+            TELEPHONY[1:-1], m.group(3))
+
+    count = 0
+    for path in smali_files(out):
+        text = read(path)
+        if TELEPHONY + '->' not in text:
+            continue
+        new, n = TELEPHONY_CALL.subn(rewrite, text)
+        if n:
+            write(path, new)
+            count += n
+    if used:
+        path = os.path.join(out, 'smali', SAFE_IDS_CLASS + '.smali')
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        header = '.class public L%s;\n.super Ljava/lang/Object;\n\n' % SAFE_IDS_CLASS
+        write(path, header + '\n'.join(safe_ids_method(method, slot) for method, slot in sorted(used)))
+    return count
+
+
+# ---- native methods of SDK classes -----------------------------------------------------------------------------------
+# `.method <flags> native <name>(<params>)<ret>` ... `.end method`
+NATIVE_METHOD = re.compile(
+    r'^(\.method [^\n]*?) native ([^\n(]+\([^)]*\)(\S+))[ \t]*\n'  # header: flags, "name(params)ret", return type
+    r'((?:(?!\.end method)[^\n]*\n)*?)'                            # annotations / .param lines
+    r'\.end method', re.M)
+
+
+def default_return(ret):
+    if ret == 'V':
+        return '    return-void'
+    if ret in 'JD':
+        return '    const-wide/16 v0, 0x0\n    return-wide v0'
+    if ret[0] in 'L[':
+        return '    const/4 v0, 0x0\n    return-object v0'
+    return '    const/4 v0, 0x0\n    return v0'
+
+
+def stub_foreign_natives(out, keep=('com/popcap/', 'com/stub/', 'com/qihoo')):
+    """Native methods of SDK classes live in 32-bit libraries the bridge cannot load, so calling them throws
+    UnsatisfiedLinkError (often on a worker thread, which kills the process). They are turned into methods that return
+    0 / null / void. Classes under the `keep` prefixes (the game itself and the packer stub) are left alone: their
+    natives are provided by the game library or the packer. Returns the number of methods stubbed."""
+    root = os.path.join(out, 'smali')
+    count = 0
+
+    def stub(m):
+        nonlocal count
+        count += 1
+        return '%s %s\n    .locals 2\n%s%s\n.end method' % (m.group(1), m.group(2), m.group(4), default_return(m.group(3)))
+
+    for path in smali_files(out):
+        if os.path.relpath(path, root).replace(os.sep, '/').startswith(keep):
+            continue
+        text = read(path)
+        if ' native ' in text:
+            new = NATIVE_METHOD.sub(stub, text)
+            if new != text:
+                write(path, new)
+    return count
+
+
 def fix_styles(out):
     path = os.path.join(out, 'res', 'values', 'styles.xml')
     if not os.path.exists(path):
@@ -242,6 +355,8 @@ def main():
         for c in candidates:
             print('  ' + c)
     fix_styles(args.out)
+    print('SDK native methods stubbed: %d' % stub_foreign_natives(args.out))
+    print('telephony identifier calls guarded: %d' % guard_identifier_calls(args.out))
     print('ported ->', args.out)
 
 

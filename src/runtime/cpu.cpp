@@ -121,8 +121,33 @@ u32 guest_call(u32 pc, std::initializer_list<u32> a, u32* high_word) {
   return guest_callv(pc, a.begin(), (int)a.size(), high_word);
 }
 
+void (*g_syscall_hook)(uint32_t* regs) = nullptr;
+
+#ifdef A32_TRACE
+#ifndef A32_TRACE_LIMIT
+#define A32_TRACE_LIMIT 300  // number of calls traced from the start (then one in 200000)
+#endif
+
+// For stubs that take a path or a name, the string is printed as well.
+static const char* traced_string(const char* stub, const std::array<uint32_t, 16>& regs) {
+  static const char* const first_arg[] = {"open", "fopen", "access", "stat", "opendir", "mkdir", "remove", "dlopen", "getenv"};
+  static const char* const second_arg[] = {"strstr", "dlsym"};  // (haystack/handle, needle/name)
+  for (const char* name : first_arg)
+    if (!strcmp(stub, name) && regs[0] > 0x1000 && regs[0] < KUSER_BASE)
+      return (const char*)H(regs[0]);
+  for (const char* name : second_arg)
+    if (!strcmp(stub, name) && regs[1] > 0x1000 && regs[1] < KUSER_BASE)
+      return (const char*)H(regs[1]);
+  return "";
+}
+#endif
+
 void Cpu::CallSVC(u32 idx) {
   if (idx == 0) {
+    if (g_syscall_hook && jit->Regs()[15] != RET_ADDR + 4) {
+      g_syscall_hook(jit->Regs().data());
+      return;
+    }
     jit->HaltExecution();
     return;
   }  // return to RET_ADDR
@@ -137,8 +162,11 @@ void Cpu::CallSVC(u32 idx) {
   {
     static std::atomic<unsigned> n;
     unsigned k = n++;
-    if (k < 300 || k % 200000 == 0)
-      LOG("stub#%u %s lr=%08x", k, stub->name, jit->Regs()[14]);
+    if (k < A32_TRACE_LIMIT || k % 200000 == 0) {
+      auto& r = jit->Regs();
+      LOG("stub#%u %s lr=%08x r0=%08x r1=%08x r2=%08x %s", k, stub->name, r[14], r[0], r[1], r[2],
+          traced_string(stub->name, r));
+    }
   }
 #endif
   Ctx ctx;

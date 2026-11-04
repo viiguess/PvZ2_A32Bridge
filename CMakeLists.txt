@@ -12,6 +12,7 @@ set(LIBNAME Game CACHE STRING "Name of the game library to stand in for (produce
 set(ORIG_SIG_HASH "500290098" CACHE STRING
     "Signature.hashCode() of the original APK signer, returned when the game checks its own signature (default: PopCap/EA). Empty disables.")
 option(A32_LOG "Log translator messages and the game's own log/stdio output to logcat" OFF)
+option(A32_FREE_SHOP "Runtime patch: PvZ2C purchases complete without the payment SDK (Lenovo 1.3.x signatures)" OFF)
 option(A32_TRACE "Also log every guest->host stub and JNI call (very verbose)" OFF)
 set(A32_DYNARMIC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/dynarmic" CACHE PATH "Dynarmic source tree (git submodule)")
 set(A32_BOOST_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/boost" CACHE PATH
@@ -70,6 +71,9 @@ target_link_libraries(${LIBNAME} PRIVATE dynarmic log z dl OpenSLES android)
 target_compile_options(${LIBNAME} PRIVATE -O2 -fvisibility=hidden -Wall -Wno-writable-strings)
 target_link_options(${LIBNAME} PRIVATE -Wl,--exclude-libs,ALL -Wl,-z,max-page-size=16384)
 
+if(A32_FREE_SHOP)
+  target_compile_definitions(${LIBNAME} PRIVATE A32_FREE_SHOP)
+endif()
 if(A32_LOG OR A32_TRACE)
   target_compile_definitions(${LIBNAME} PRIVATE A32_LOG)
 endif()

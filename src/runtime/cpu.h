@@ -25,3 +25,8 @@ u32 cpu_lr(Cpu* cpu);  // guest LR of a running CPU (diagnostics)
 // Calls a guest function (Thumb if bit 0 of `pc` is set) and returns r0; r1 receives the high word of 64-bit results.
 u32 guest_callv(u32 pc, const u32* args, int count, u32* high_word);
 u32 guest_call(u32 pc, std::initializer_list<u32> args, u32* high_word = nullptr);
+
+// Optional: emulation of Linux system calls. Guest code that issues a raw `svc #0` (EABI: number in r7, arguments in
+// r0-r5) is passed to this hook with the 16 guest registers; it stores the result in regs[0]. Without a hook such an
+// svc is treated as "return to the host".
+extern void (*g_syscall_hook)(uint32_t* regs);
