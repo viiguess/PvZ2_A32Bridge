@@ -6,11 +6,16 @@
 
 #include <dlfcn.h>
 #include <sys/mman.h>
+#include <unistd.h>
+
+#include <stdio.h>
+#include <string.h>
 
 #include <string>
 
 #include "jni/handles.h"
 #include "libc/libc.h"
+#include "libc/system_imports.h"
 #include "opensles.h"
 #include "runtime/live_patch.h"
 
@@ -41,6 +46,28 @@ u32 jni_guest_vm() {
   return g_gvm;
 }
 
+// The app's native library directory, "" if it cannot be determined. The application object does not exist yet when a
+// library is loaded from Application.attachBaseContext, so the directory is derived from where the APK is mapped:
+// /data/app/<package>-<id>/base.apk -> /data/app/<package>-<id>/lib/arm64.
+static std::string native_library_dir() {
+  FILE* maps = fopen("/proc/self/maps", "r");
+  if (!maps)
+    return "";
+  std::string result;
+  char line[1024];
+  while (fgets(line, sizeof line, maps)) {
+    char* path = strchr(line, '/');
+    char* apk = path ? strstr(path, "/base.apk") : nullptr;
+    if (apk) {
+      result.assign(path, apk - path);
+      result += "/lib/arm64";
+      break;
+    }
+  }
+  fclose(maps);
+  return result;
+}
+
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
   // The whole 4 GiB guest address space is one lazily-committed host reservation.
   void* reservation =
@@ -63,10 +90,19 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
   std::string path = info.dli_fname;
   path.resize(path.size() - 3);
   path += "_a32.so";
+  // A library that was copied away from the app's lib directory (a packer's stub unpacks itself into the app's data
+  // directory) has no guest next to it: look in the native library directory under the library's own name.
+  if (access(path.c_str(), R_OK) != 0) {
+    std::string dir = native_library_dir();
+    if (!dir.empty())
+      path = dir + "/lib" A32_LIBNAME "_a32.so";
+  }
   LOG("loading %s", path.c_str());
   if (!load_elf(path.c_str(), g_main))
     return JNI_ERR;
   LOG("elf loaded, %zu init fns", g_main.init.size());
+  install_fake_proc_maps();
+  install_syscalls();
   apply_live_patches(g_main);
   for (u32 constructor : g_main.init)
     guest_callv(constructor, nullptr, 0, nullptr);

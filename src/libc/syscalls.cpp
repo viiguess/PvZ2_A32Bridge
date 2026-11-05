@@ -8,7 +8,8 @@
 #include <time.h>
 #include <unistd.h>
 
-#include "host_env.h"
+#include "libc/stdio_imports.h"
+#include "libc/system_imports.h"
 #include "runtime/runtime.h"
 
 namespace {
@@ -56,6 +57,11 @@ enum Syscall : uint32_t {
 constexpr int kProcessId = 4242;
 constexpr int kUserId = 10123;
 constexpr int kAtFdCwd = -100;          // the guest's AT_FDCWD
+// Paths the guest opens may be redirected (see g_path_hook), for example to serve a synthetic /proc/self/maps.
+const char* rewrite_path(const char* path) {
+  return g_path_hook ? g_path_hook(path) : path;
+}
+
 constexpr int kOpenFlagMask = 0xFFFFF;  // ARM and x86-64 agree on the low open() flags we care about
 
 long errno_result(long r) {
@@ -106,11 +112,11 @@ long dispatch(uint32_t nr, const uint32_t* a, const char** name) {
       return errno_result(write(a[0], H(a[1]), a[2]));
     case ARM_SYS_OPEN:
       *name = "open";
-      return errno_result(open((const char*)H(a[0]), (int)a[1] & kOpenFlagMask, a[2]));
+      return errno_result(open(rewrite_path((const char*)H(a[0])), (int)a[1] & kOpenFlagMask, a[2]));
     case ARM_SYS_OPENAT:
       *name = "openat";
       return errno_result(
-          openat((int)a[0] == kAtFdCwd ? AT_FDCWD : (int)a[0], (const char*)H(a[1]), (int)a[2] & kOpenFlagMask, a[3]));
+          openat((int)a[0] == kAtFdCwd ? AT_FDCWD : (int)a[0], rewrite_path((const char*)H(a[1])), (int)a[2] & kOpenFlagMask, a[3]));
     case ARM_SYS_CLOSE:
       *name = "close";
       return errno_result(close(a[0]));
@@ -176,8 +182,8 @@ void syscall_hook(uint32_t* regs) {
   const uint32_t* args = regs;  // r0-r5
   const char* name = "?";
   long result = dispatch(nr, args, &name);
-  fprintf(stderr, "[sys] #%u %s(%08x, %08x, %08x, %08x) = %ld  lr=%08x\n", nr, name, args[0], args[1], args[2], args[3],
-          result, regs[14]);
+  LOG("[sys] #%u %s(%08x, %08x, %08x, %08x) = %ld  lr=%08x", nr, name, args[0], args[1], args[2], args[3], result,
+      regs[14]);
   regs[0] = (uint32_t)result;
 }
 

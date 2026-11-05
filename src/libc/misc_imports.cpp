@@ -200,9 +200,9 @@ void register_misc_imports() {
   hle("__stack_chk_fail", abort_process);
   for (const char* name : {"__cxa_atexit", "__cxa_finalize", "__aeabi_atexit", "raise", "getppid", "ptrace", "prctl",
                            "pthread_attr_destroy", "pthread_mutexattr_destroy", "pthread_mutexattr_setpshared",
-                           "pthread_condattr_init", "pthread_condattr_destroy"})
+                           "pthread_condattr_init", "pthread_condattr_destroy", "setpgid", "fcntl", "inet_ntoa", "popen"})
     hle(name, return_zero);
-  for (const char* name : {"fork", "execv", "system", "waitpid"})
+  for (const char* name : {"fork", "execv", "execve", "system", "waitpid", "creat", "pclose", "pwrite"})
     hle(name, return_minus_one);
   hle("sigaction", import_sigaction);
   hle("syscall", import_syscall);

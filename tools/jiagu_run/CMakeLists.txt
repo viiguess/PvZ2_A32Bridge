@@ -35,7 +35,7 @@ file(GLOB RUNTIME_SOURCES ${ROOT}/src/runtime/*.cpp ${ROOT}/src/libc/*.cpp)
 list(FILTER RUNTIME_SOURCES EXCLUDE REGEX "/(live_patch|gles_imports)\\.cpp$")
 
 add_executable(jiagu_run
-  main.cpp fake_java.cpp fake_jni.cpp host_env.cpp syscalls.cpp
+  main.cpp fake_java.cpp fake_jni.cpp host_env.cpp
   ${RUNTIME_SOURCES})
 target_include_directories(jiagu_run PRIVATE ${ROOT}/src shim)
 target_compile_definitions(jiagu_run PRIVATE A32_LOG A32_HOST_RUNNER)

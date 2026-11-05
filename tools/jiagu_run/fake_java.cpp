@@ -1,4 +1,5 @@
 #include "fake_java.h"
+#include "runtime/runtime.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -151,6 +152,27 @@ uint64_t java_call(const MethodId& m, u32 self) {
     return new_string(g_cfg.package);
   if (n == "getApplicationInfo")
     return new_instance("android/content/pm/ApplicationInfo");
+  // The packer stub (com.stub.StubApp) keeps where it unpacked its library in static fields and hands them back.
+  if (m.cls == "com/stub/StubApp" && ret == 'L') {
+    if (n == "getDir")
+      return new_string(g_cfg.work_dir + "/.jiagu");
+    if (n == "getJiaguSoName")
+      return new_string("libjiagu.so");
+    if (n == "getSoPath")
+      return new_string(g_cfg.work_dir + "/.jiagu/libjiagu.so");
+  }
+  if (n == "getBytes" && self) {  // String.getBytes(...) -> byte[]
+    Obj* text = obj_of(self);
+    if (text && text->is_string) {
+      Obj bytes;
+      bytes.cls = "[prim";
+      bytes.len = (u32)text->str.size();
+      bytes.elem_size = 1;
+      bytes.buf = gmalloc(bytes.len + 8);
+      memcpy(H(bytes.buf), text->str.data(), bytes.len);
+      return new_obj(bytes);
+    }
+  }
   if (n == "getFilesDir" || n == "getCacheDir" || n == "getDir")
     return new_instance("java/io/File");
   if (n == "getAbsolutePath" || n == "getPath")
@@ -165,7 +187,9 @@ uint64_t java_call(const MethodId& m, u32 self) {
     return new_string("zh");
   if (n == "getCountry")
     return new_string("CN");
-  if (n == "get" || n == "getProperty" || n == "getString")
+  if (n == "getProperty")  // the only property packers ask for is java.vm.version: ART reports "2.x.y"
+    return new_string("2.1.0");
+  if (n == "get" || n == "getString")
     return new_string("");
 
   // Anything that returns an object gets a fresh instance of the declared type, so chains of calls keep working.

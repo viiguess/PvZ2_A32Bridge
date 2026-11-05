@@ -9,6 +9,3 @@ void register_host_imports();
 // Writes the file that /proc/self/maps is redirected to: the library itself plus a plausible set of system libraries.
 // Call after the library is loaded (its address range is needed).
 void write_fake_maps();
-
-// Emulates the Linux system calls the guest issues with a raw `svc #0` (syscalls.cpp).
-void install_syscalls();

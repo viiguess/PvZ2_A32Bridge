@@ -57,9 +57,28 @@ build differs only where `A32_HOST_RUNNER` is defined (`src/libc/stdio_imports.c
 function. Two optional hooks let an embedding program extend the runtime: `g_path_hook` (rewrite opened paths, see
 `libc/stdio_imports.h`) and `g_syscall_hook` (emulate raw system calls, see `runtime/cpu.h`).
 
+## Getting the decrypted dex
+
+A packer hands its decrypted dex to ART through `art::DexFile::OpenMemory`. The runner answers those lookups with a
+function that saves the dex to `<workdir>/classes_unpacked.dex` and returns a fake `DexFile` (virtual methods that return
+0, fields pointing at the dex), so the packer carries on. The result can be added to the ported APK as an extra dex
+(`port_apk.py --jiagu-dex`).
+
+`JR_CALL=name[,name...]` calls natives the library registered (`RegisterNatives`) once `JNI_OnLoad` has run, with
+placeholder arguments (`JR_INT` is the value of integer arguments), and the `[jni]` lines show what they do. This is how
+the protected classes were found: `JR_CALL=interface11 JR_INT=9` makes the stub register the native `onCreate` of the
+class whose static initializer calls `StubApp.interface11(9)`.
+
+## Running it on a device
+
+There is no need for a Linux host: the runner is an ordinary arm64 program. Build it with the NDK
+(`cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a ...`; bionic has no
+`libpthread`, so pass `-DCMAKE_EXE_LINKER_FLAGS=-L<dir with an empty libpthread.a>`), push it with the library and the APK to
+`/data/local/tmp`, and run it with `adb shell`.
+
 ## Status
 
 Tested with the 360 Jiagu stub of Plants vs. Zombies 2 Chinese 2.2.7. `libjiagu.so` loads, runs its anti-debug and
-device-information checks, unpacks and loads its embedded second stage, and `JNI_OnLoad` returns success. It does not
-call `RegisterNatives`, so the `com.stub.StubApp` natives that decrypt the dex are not available yet; the second stage
-has to be analysed to find out how they are bound.
+device-information checks, unpacks and loads its embedded second stage, decrypts the dex, and `JNI_OnLoad` returns success
+with 14 natives registered (the `com.stub.StubApp` ones among them). The natives of the protected classes are registered
+by `StubApp.interface11(n)` when the class is initialised.

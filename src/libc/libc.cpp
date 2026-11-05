@@ -12,6 +12,7 @@
 #include "libc/gles_imports.h"
 #include "libc/memory_imports.h"
 #include "libc/misc_imports.h"
+#include "libc/system_imports.h"
 #include "libc/pthread_imports.h"
 #include "libc/stdio_imports.h"
 #include "libc/time_imports.h"
@@ -74,6 +75,7 @@ void libc_init() {
 
   register_memory_imports();
   register_misc_imports();
+  register_system_imports();
   register_time_imports();
   register_stdio_imports();
   register_pthread_imports();

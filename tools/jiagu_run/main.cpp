@@ -11,12 +11,14 @@
 #include <sys/mman.h>
 
 #include <string>
+#include <vector>
 
 #include "fake_java.h"
 #include "fake_jni.h"
 #include "host_env.h"
 #include "libc/gles_imports.h"
 #include "libc/libc.h"
+#include "libc/system_imports.h"
 #include "runtime/runtime.h"
 
 // The host build has no GLES; the game's GL imports are not needed to run a packer.
@@ -36,6 +38,20 @@ bool reserve_guest_space() {
   }
   G = (uint8_t*)(((uintptr_t)mem + 0xfff) & ~0xfffull);
   return true;
+}
+
+std::vector<std::string> split_list(const std::string& text) {
+  std::vector<std::string> items;
+  size_t start = 0;
+  while (start <= text.size()) {
+    size_t end = text.find(',', start);
+    if (end == std::string::npos)
+      end = text.size();
+    if (end > start)
+      items.push_back(text.substr(start, end - start));
+    start = end + 1;
+  }
+  return items;
 }
 
 bool parse_args(int argc, char** argv) {
@@ -118,6 +134,25 @@ int main(int argc, char** argv) {
             registered_natives().size());
   } else {
     fprintf(stderr, "[run] the library has no JNI_OnLoad\n");
+  }
+
+  // JR_CALL=name[,name...]: call registered natives (static or instance) with placeholder arguments, to see what they do.
+  if (const char* calls = getenv("JR_CALL")) {
+    for (const std::string& want : split_list(calls)) {
+      for (const RegisteredNative& native : registered_natives()) {
+        if (native.name != want)
+          continue;
+        char ret;
+        std::vector<char> params = signature_args(native.sig, ret);
+        std::vector<u32> args = {fake_jni_env(), class_handle(native.cls)};
+        int objects = 0;
+        for (char param : params)
+          args.push_back(param != 'L' ? (u32)(getenv("JR_INT") ? atoi(getenv("JR_INT")) : 0) : objects++ == 0 ? new_instance("android/app/Application") : new_instance("android/content/Context"));
+        fprintf(stderr, "[run] calling %s.%s%s\n", native.cls.c_str(), native.name.c_str(), native.sig.c_str());
+        u32 result = guest_callv(native.fn, args.data(), (int)args.size(), nullptr);
+        fprintf(stderr, "[run] %s returned %08x\n", native.name.c_str(), result);
+      }
+    }
   }
 
   dump_requested_memory();

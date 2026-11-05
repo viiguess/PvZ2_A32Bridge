@@ -102,6 +102,7 @@ static void apply_relocations(const Image& image, const DynInfo& symbols, u32 ta
 }
 
 bool load_elf(const char* path, Image& image) {
+  image.path = path;
   std::vector<uint8_t> file;
   if (!read_file(path, file))
     return false;

@@ -113,12 +113,36 @@ classes (payment, analytics, ...) are stubbed to return 0/null/void instead of t
 `TelephonyManager` identifier calls that throw `SecurityException` on Android 10+ (`getDeviceId`, `getSubscriberId`, ...)
 are guarded so they return null. Classes under `com/popcap` keep their natives.
 
+## Packed games (360 Jiagu)
+
+A packed game hides its dex inside `classes.dex` and replaces some `Activity.onCreate` methods with natives that a
+packer library (`libjiagu.so`, 32-bit) binds at run time, so the stub cannot run in a 64-bit process either. The bridge
+runs the packer's library the same way it runs the game's:
+
+1. Build a second bridge with `-DLIBNAME=jiagu`. The stub copies `assets/libjiagu_a64.so` out of the APK on 64-bit
+   devices and loads it, so this bridge takes that place. The packer's own library becomes the guest,
+   `lib/arm64-v8a/libjiagu_a32.so`, and the bridge finds it through the app's native library directory.
+2. Run `tools/jiagu_run` on the original library to get the decrypted dex (`classes_unpacked.dex`). The bridge cannot
+   hand a dex to ART the way the packer does on an old Android, so the classes are added to the app as an extra dex.
+3. Port with `port_apk.py ... --jiagu-bridge libjiagu.so --jiagu-dex classes_unpacked.dex --baksmali baksmali.jar`.
+   The game's bridge (`-DLIBNAME=<game library>`) is the positional argument as usual.
+4. Rebuild with apktool, then `port_apk.py finish original.apk rebuilt.apk output.apk`, then zipalign and sign. This
+   step matters: apktool rebuilds `classes.dex` from smali and drops the packer's payload and the ZIP comment it
+   reads, and the packer refuses to start without them. The packer's stub is never edited.
+
+What the bridge provides for the packer (`src/libc/system_imports.cpp`, `syscalls.cpp`): a synthetic
+`/proc/self/maps` (also `/proc/<pid>/maps`, also through a raw `open`), raw `svc #0` system calls, and the
+`art::DexFile::OpenMemory` entry points. SDKs inside a packed game that need their own 32-bit natives (carrier payment
+and login SDKs) still cannot run; `port_apk.py` makes the Chinese Plants vs. Zombies 2 builds start without them
+(null-safe Unicom wrapper, Talkweb initialisation reported as done), but payments through them do not work. See also
+`tools/jiagu_run/README.md`.
+
 ## Tools
 
 | Tool | Purpose |
 | --- | --- |
-| `tools/port_apk.py` | Prepares a decoded APK for the bridge (see above) |
-| `tools/jiagu_run/` | Runs a 32-bit library, for example a packer stub such as 360 Jiagu, on a Linux/WSL host with a fake JNI environment, to study or unpack it without a device (see its README) |
+| `tools/port_apk.py` | Prepares a decoded APK for the bridge (see above); `port_apk.py finish` restores the packed dex of a packed game |
+| `tools/jiagu_run/` | Runs a 32-bit library, for example a packer stub such as 360 Jiagu, with a fake JNI environment, to study or unpack it without running the app (Linux/WSL host, or the device through `adb shell`; see its README) |
 
 ## Debugging
 
