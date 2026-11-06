@@ -32,6 +32,8 @@ What it does:
   8. 360 Jiagu packed games (--jiagu-bridge, --jiagu-dex, --baksmali): see "Packed games" in the README. After
      apktool has rebuilt the APK, `port_apk.py finish original.apk rebuilt.apk output.apk` puts the packed classes.dex
      and the ZIP comment back; then zipalign and sign.
+  8b. Muzhiwan embed SDK (a wrapper around some Chinese builds, 1.0.x): removed. Its Application, launcher activity
+     and signature checks (`PopUtils`) are not needed and cannot run here.
   9. Talkweb / China Unicom SDKs of the Chinese Plants vs. Zombies 2 builds (2.x): their start-up needs 32-bit natives,
      so UnicomApplicationWrapper is made null-safe and TWPurchase's SDK initialisation reports success directly.
      Applied only when those classes exist; payments through these SDKs do not work.
@@ -410,6 +412,50 @@ def skip_talkweb_init(out):
     return True
 
 
+# ---- Muzhiwan embed SDK ----------------------------------------------------------------------------------------------
+# Some Chinese builds are wrapped by the Muzhiwan (muzhiwan.com) layer: a custom Application whose native library
+# unpacks an encrypted SDK jar, a launcher activity (MzwActivity) that shows its splash, checks for updates and verifies
+# the APK signature, and `PopUtils` calls inside the game that exit the process when the signing certificate differs.
+# None of it is needed to run the game, and the SDK cannot start here (it needs 32-bit natives, an old Android's file
+# access and an online service), so the layer is removed and the game's own activity becomes the launcher.
+MZW_POP_UTILS = 'com/muzhiwan/embed/sdk/PopUtils.smali'
+MZW_APPLICATION = ' android:name="com.muzhiwan.embed.sdk.MzwApplication"'
+MZW_ACTIVITY = re.compile(r'\s*<activity android:name="com\.muzhiwan\.embed\.MzwActivity".*?</activity>', re.S)
+MZW_SDK_CALL = re.compile(r'[ \t]*invoke-static(?:/range)? \{[^}]*\}, Lcom/muzhiwan/embed/utils/SDKUtils;->[^\n]*\n')
+STATIC_VOID_METHOD = re.compile(r'^(\.method public static [^\n]*\)V)\n.*?^\.end method', re.S | re.M)
+
+
+def remove_muzhiwan(out):
+    """Returns the number of PopUtils methods turned into no-ops (0 when the game is not wrapped)."""
+    pop = find_class(out, MZW_POP_UTILS)
+    if not pop:
+        return 0
+    count = 0
+
+    def empty(m):
+        nonlocal count
+        count += 1
+        return m.group(1) + '\n    .locals 0\n    return-void\n.end method'
+
+    write(pop, STATIC_VOID_METHOD.sub(empty, read(pop)))  # capture, showWindow, ... and the signature check
+    for path in smali_files(out):  # calls into the SDK jar that is no longer there
+        text = read(path)
+        if 'Lcom/muzhiwan/embed/utils/SDKUtils;' in text:
+            write(path, MZW_SDK_CALL.sub('', text))
+
+    manifest = os.path.join(out, 'AndroidManifest.xml')
+    text = read(manifest).replace(MZW_APPLICATION, '', 1)
+    launcher = MZW_ACTIVITY.search(text)
+    if launcher:  # the game activity takes over the MAIN / LAUNCHER filter
+        game = re.search(r'(<activity [^>]*android:name="[^"]*SexyAppActivity"[^>]*>)\s*<intent-filter/>', text)
+        filter_xml = re.search(r'<intent-filter>.*?</intent-filter>', launcher.group(0), re.S).group(0)
+        text = text.replace(launcher.group(0), '', 1)
+        if game:
+            text = text.replace(game.group(0), game.group(1) + '\n            ' + filter_xml, 1)
+    write(manifest, text)
+    return count
+
+
 def fix_styles(out):
     path = os.path.join(out, 'res', 'values', 'styles.xml')
     if not os.path.exists(path):
@@ -490,6 +536,9 @@ def main():
         add_unpacked_dex(args.out, args.jiagu_dex, args.baksmali)
     if args.jiagu_bridge:
         install_jiagu(args.out, args.jiagu_bridge)
+    removed = remove_muzhiwan(args.out)
+    if removed:
+        print('Muzhiwan embed SDK removed: %d PopUtils methods turned into no-ops, game activity is the launcher' % removed)
     guarded, skipped = guard_unicom_wrapper(args.out), skip_talkweb_init(args.out)
     if guarded or skipped:
         print('Talkweb/Unicom SDK patches: %d Unicom call(s) guarded, Talkweb init %s'

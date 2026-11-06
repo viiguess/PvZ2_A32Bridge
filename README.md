@@ -85,7 +85,7 @@ Options:
 | --- | --- |
 | `LIBNAME` | Name of the game library to stand in for (`libGame.so`). Must match `System.loadLibrary("Game")` |
 | `ORIG_SIG_HASH` | Value returned for `Signature.hashCode()` (see above). Default `500290098` (PopCap/EA); empty disables |
-| `A32_FREE_SHOP` | Runtime patch for the Lenovo PvZ2C 32-bit builds 1.0.4 - 4.2.4 (ARM and Thumb-2, every optimisation level): `PurchaseBroker::onPurchaseConfirm` reports the order as paid instead of calling the payment SDK, and the dialogs that wait for the SDK are skipped (`src/runtime/free_shop.h`). Sites are found by instruction shape and string references, and nothing is patched unless every site is found; the log (`A32_LOG`) says why a build was skipped. Off by default |
+| `A32_FREE_SHOP` | Runtime patch for the Lenovo PvZ2C 32-bit builds 1.0.1 - 4.2.4 (ARM and Thumb-2, every optimisation level): `PurchaseBroker::onPurchaseConfirm` reports the order as paid instead of calling the payment SDK, and the dialogs that wait for the SDK are skipped (`src/runtime/free_shop.h`). Sites are found by instruction shape and string references, and nothing is patched unless every site is found; the log (`A32_LOG`) says why a build was skipped. Off by default |
 | `A32_LOG` | Log translator messages and the game's own log/stdio output to logcat (tag `a32`) |
 | `A32_TRACE` | Additionally log every stub and JNI call (very verbose) |
 | `A32_DYNARMIC_DIR`, `A32_BOOST_DIR` | Locations of the third-party sources (defaults: `third_party/...`) |

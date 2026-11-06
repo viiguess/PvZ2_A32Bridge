@@ -229,8 +229,15 @@ inline std::vector<size_t> find_payment_complete(const u32* w, size_t n, u32 sta
         for (size_t q = k + 1; q < k + 8 && q < i; q++)
           if ((w[q] & 0xFFF00FFF) == (0xE5900000 | player_offset) && reg(w[q], 16) == 0)
             player = true;
-        if (player && (found.empty() || found.back() != k))
-          found.push_back(k);
+        // the scheduler may hoist the player load above the push (1.0.x): then the load is the function's entry
+        size_t entry = k;
+        for (size_t q = k - 1; q + 3 > k && !player; q--)
+          if ((w[q] & 0xFFF00FFF) == (0xE5900000 | player_offset) && reg(w[q], 16) == 0) {
+            player = true;
+            entry = q;
+          }
+        if (player && (found.empty() || found.back() != entry))
+          found.push_back(entry);
         break;
       }
     }
