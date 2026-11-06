@@ -10,6 +10,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <mutex>
+#include <string>
+#include <vector>
+
 #include "libc/libc.h"
 #include "libc/stdio_imports.h"
 #include "runtime/runtime.h"
@@ -137,7 +141,16 @@ static void import_open_memory(Ctx& ctx, const Stub&) {  // (const uint8_t* base
 }
 
 // ---- /proc/self/maps ------------------------------------------------------------------------------------------------
-static char g_maps_path[32];
+static char g_maps_path[256];
+static int g_maps_memfd = -1;
+static std::mutex g_maps_mutex;
+
+struct MappedImage {
+  u32 base, size;
+  std::string name;
+};
+
+static std::vector<MappedImage> g_maps_images;  // the guest library, then companion libraries (mods)
 
 // "/proc/self/maps" and "/proc/<pid>/maps" (packers build the second form from getpid()).
 static bool is_proc_maps(const char* path) {
@@ -149,7 +162,13 @@ static const char* maps_path_hook(const char* path) {
   return is_proc_maps(path) && g_maps_path[0] ? g_maps_path : path;
 }
 
-void install_fake_proc_maps() {
+// lib<name>_a32.so is listed as lib<name>.so: hook libraries look the game library up by its original name.
+std::string shown_name(const std::string& path) {
+  size_t suffix = path.rfind("_a32.so");
+  return suffix != std::string::npos && suffix + 7 == path.size() ? path.substr(0, suffix) + ".so" : path;
+}
+
+static void write_maps() {  // under g_maps_mutex
   static const char* const kSystemMappings[] = {
       "b6f00000-b6f20000 r-xp 00000000 103:00 301 /system/bin/linker",
       "b6f20000-b6f22000 r--p 00020000 103:00 301 /system/bin/linker",
@@ -161,19 +180,64 @@ void install_fake_proc_maps() {
       "b6a00000-b6bf0000 r-xp 00000000 103:00 304 /system/lib/libart.so",
       "be000000-be021000 rw-p 00000000 00:00 0 [stack]",
   };
-  int fd = (int)syscall(SYS_memfd_create, "maps", 0);  // an anonymous file, reachable as /proc/self/fd/<n>
-  if (fd < 0)
+  std::string text;
+  char line[600];
+  for (const MappedImage& image : g_maps_images) {
+    snprintf(line, sizeof line, "%08x-%08x r-xp 00000000 fd:01 4242 %s\n", image.base, image.base + image.size,
+             image.name.c_str());
+    text += line;
+  }
+  for (const char* mapping : kSystemMappings)
+    (text += mapping) += '\n';
+
+  if (g_maps_memfd >= 0) {
+    (void)!ftruncate(g_maps_memfd, 0);
+    (void)!pwrite(g_maps_memfd, text.data(), text.size(), 0);
     return;
-  FILE* file = fdopen(fd, "w");
-  if (!file)
+  }
+  if (FILE* file = fopen(g_maps_path, "w")) {
+    fwrite(text.data(), 1, text.size(), file);
+    fclose(file);
+  }
+}
+
+// The app's cache directory (some devices' SELinux policy forbids reopening a memfd), else a memfd (Linux host).
+static void choose_maps_file() {
+  char package[256] = {};
+  if (FILE* f = fopen("/proc/self/cmdline", "r")) {
+    (void)!fread(package, 1, sizeof package - 1, f);
+    fclose(f);
+  }
+  if (package[0] && !strchr(package, '/')) {
+    snprintf(g_maps_path, sizeof g_maps_path, "/data/data/%s/cache/a32_maps", package);
+    if (FILE* probe = fopen(g_maps_path, "w")) {
+      fclose(probe);
+      return;
+    }
+  }
+  g_maps_memfd = (int)syscall(SYS_memfd_create, "maps", 0);
+  if (g_maps_memfd < 0) {
+    g_maps_path[0] = 0;
     return;
-  fprintf(file, "%08x-%08x r-xp 00000000 fd:01 4242 %s\n", g_main.base, g_main.base + g_main.size,
-          g_main.path.c_str());
-  for (const char* line : kSystemMappings)
-    fprintf(file, "%s\n", line);
-  fflush(file);  // the stream stays open so the descriptor keeps the file alive
-  snprintf(g_maps_path, sizeof g_maps_path, "/proc/self/fd/%d", fd);
+  }
+  snprintf(g_maps_path, sizeof g_maps_path, "/proc/self/fd/%d", g_maps_memfd);
+}
+
+void install_fake_proc_maps() {
+  std::lock_guard<std::mutex> lock(g_maps_mutex);
+  choose_maps_file();
+  if (!g_maps_path[0])
+    return;
+  g_maps_images.insert(g_maps_images.begin(), MappedImage{g_main.base, g_main.size, shown_name(g_main.path)});
+  write_maps();
   g_path_hook = maps_path_hook;
+}
+
+void fake_proc_maps_add(const Image& image) {
+  std::lock_guard<std::mutex> lock(g_maps_mutex);
+  g_maps_images.push_back(MappedImage{image.base, image.size, shown_name(image.path)});
+  if (g_maps_path[0])
+    write_maps();
 }
 
 void register_system_imports() {

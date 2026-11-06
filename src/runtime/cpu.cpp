@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <mutex>
@@ -9,6 +10,7 @@
 
 #include "dynarmic/interface/exclusive_monitor.h"
 
+#include "runtime/code_dump.h"
 #include "runtime/jit.h"
 #include "runtime/runtime.h"
 #include "runtime/thread.h"
@@ -20,6 +22,7 @@ static PageTable* g_pt;
 static Dynarmic::ExclusiveMonitor* g_mon;  // shared by all JITs: ldrex/strex are real host atomics
 static std::mutex g_cpu_mu;
 static std::vector<size_t> g_free_pid;
+static std::vector<Cpu*> g_all_cpus;
 static size_t g_next_pid;
 
 enum { MAX_JITS = 512 };
@@ -62,12 +65,28 @@ Cpu::Cpu(Thread* thr, int depth) : thr(thr) {
   conf.define_unpredictable_behaviour = true;
   conf.wall_clock_cntpct = true;
   conf.code_cache_size = (depth == 0 ? 96u : 16u) << 20;  // virtual only; the JIT flushes when full
+  // Games need no bit-exact NaN/FMA behaviour; the global monitor stays exact for ldrex/strex locks.
+  conf.unsafe_optimizations = true;
+  conf.optimizations = Dynarmic::all_safe_optimizations | Dynarmic::OptimizationFlag::Unsafe_UnfuseFMA |
+                       Dynarmic::OptimizationFlag::Unsafe_ReducedErrorFP |
+                       Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN |
+                       Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
   jit = new Dynarmic::A32::Jit(conf);
+  std::lock_guard<std::mutex> lock(g_cpu_mu);
+  g_all_cpus.push_back(this);
+}
+
+void cpu_invalidate_range(u32 start, u32 size) {
+  code_dump_on_flush(start, size);
+  std::lock_guard<std::mutex> lock(g_cpu_mu);
+  for (Cpu* cpu : g_all_cpus)
+    cpu->jit->InvalidateCacheRange(start, size);  // halts a running JIT; guest_callv resumes it
 }
 
 Cpu::~Cpu() {
   delete jit;
   std::lock_guard<std::mutex> lock(g_cpu_mu);
+  g_all_cpus.erase(std::find(g_all_cpus.begin(), g_all_cpus.end(), this));
   g_free_pid.push_back(pid);
 }
 
@@ -80,6 +99,12 @@ static Cpu* make_cpu(Thread* thr, int depth) {
 }
 
 u32 guest_callv(u32 pc, const u32* args, int arg_count, u32* high_word) {
+  if ((pc & ~1u) == 0) {  // a null guest function pointer: nothing to run
+    LOG("guest call to address 0 ignored (host caller %p)", __builtin_return_address(0));
+    if (high_word)
+      *high_word = 0;
+    return 0;
+  }
   Thread* thr = thread();
   int depth = ++thr->depth;
   if ((int)thr->cpus.size() <= depth)
@@ -105,7 +130,11 @@ u32 guest_callv(u32 pc, const u32* args, int arg_count, u32* high_word) {
   cpu->fault = false;
   thr->running = cpu;
   thr->sp_hint = sp;
-  cpu->jit->Run();
+  Dynarmic::HaltReason reason;
+  do  // a cache invalidation halts the JIT mid-call: resume
+    reason = cpu->jit->Run();
+  while (Dynarmic::Has(reason, Dynarmic::HaltReason::CacheInvalidation) &&
+         !Dynarmic::Has(reason, Dynarmic::HaltReason::UserDefined1) && !cpu->fault);
   if (cpu->fault && !thr->exit_req)
     LOG("guest fault at pc=%08x entry=%08x", regs[15], pc);
   u32 out0 = regs[0], out1 = regs[1];

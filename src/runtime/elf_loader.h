@@ -13,6 +13,6 @@ struct Image {
   std::vector<u32> init;          // DT_INIT and DT_INIT_ARRAY entries, in call order
 };
 
-bool load_elf(const char* path, Image& image);
+bool load_elf(const char* path, Image& image, u32 base = IMG_BASE);
 u32 image_sym(const Image& image, const char* name);  // guest address of an exported symbol, 0 if absent
 extern Image g_main;                                  // the game library

@@ -101,7 +101,7 @@ static void apply_relocations(const Image& image, const DynInfo& symbols, u32 ta
   }
 }
 
-bool load_elf(const char* path, Image& image) {
+bool load_elf(const char* path, Image& image, u32 base) {
   image.path = path;
   std::vector<uint8_t> file;
   if (!read_file(path, file))
@@ -123,7 +123,7 @@ bool load_elf(const char* path, Image& image) {
     if (phdr[i].type == PT_LOAD && phdr[i].vaddr + phdr[i].memsz > image_end)
       image_end = phdr[i].vaddr + phdr[i].memsz;
   }
-  image.base = IMG_BASE;
+  image.base = base;
   image.size = (image_end + 0xfff) & ~0xfffu;
   for (int i = 0; i < ehdr->phnum; i++) {
     if (phdr[i].type == PT_LOAD)

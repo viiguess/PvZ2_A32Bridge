@@ -52,6 +52,7 @@ enum Syscall : uint32_t {
   ARM_SYS_INOTIFY_ADD_WATCH = 317,
   ARM_SYS_INOTIFY_RM_WATCH = 318,
   ARM_SYS_OPENAT = 322,
+  ARM_SYS_CACHEFLUSH = 0xf0002,  // ARM private (start, end, flags), from libgcc's __clear_cache
 };
 
 constexpr int kProcessId = 4242;
@@ -59,7 +60,7 @@ constexpr int kUserId = 10123;
 constexpr int kAtFdCwd = -100;          // the guest's AT_FDCWD
 // Paths the guest opens may be redirected (see g_path_hook), for example to serve a synthetic /proc/self/maps.
 const char* rewrite_path(const char* path) {
-  return g_path_hook ? g_path_hook(path) : path;
+  return guest_host_path(path);
 }
 
 constexpr int kOpenFlagMask = 0xFFFFF;  // ARM and x86-64 agree on the low open() flags we care about
@@ -138,6 +139,10 @@ long dispatch(uint32_t nr, const uint32_t* a, const char** name) {
     case ARM_SYS_MMAP2:
       *name = "mmap2";
       return sys_mmap2(a);
+    case ARM_SYS_CACHEFLUSH:
+      *name = "cacheflush";
+      cpu_invalidate_range(a[0], a[1] - a[0]);
+      return 0;
     case ARM_SYS_CLOCK_GETTIME:
       *name = "clock_gettime";
       return sys_clock_gettime(a);

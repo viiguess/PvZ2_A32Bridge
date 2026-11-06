@@ -113,6 +113,10 @@ static void import_qsort(Ctx& ctx, const Stub&) {
   memcpy(G + base, sorted.data(), sorted.size());
 }
 
+static void import_aeabi_memclr(Ctx& ctx, const Stub&) {
+  memset(ctx.p(0), 0, ctx.a(1));
+}
+
 void register_memory_imports() {
   hle("malloc", import_malloc);
   hle("free", import_free);
@@ -127,6 +131,12 @@ void register_memory_imports() {
   stub_add("__aeabi_memcpy", generic, dlsym(RTLD_DEFAULT, "memcpy"), "ppu>v");
   stub_add("__aeabi_memmove", generic, dlsym(RTLD_DEFAULT, "memmove"), "ppu>v");
   hle("__aeabi_memset", import_aeabi_memset);
+  for (const char* name : {"__aeabi_memclr", "__aeabi_memclr4", "__aeabi_memclr8"})
+    hle(name, import_aeabi_memclr);
+  for (const char* name : {"__aeabi_memcpy4", "__aeabi_memcpy8"})
+    stub_add(name, generic, dlsym(RTLD_DEFAULT, "memcpy"), "ppu>v");
+  for (const char* name : {"__aeabi_memmove4", "__aeabi_memmove8"})
+    stub_add(name, generic, dlsym(RTLD_DEFAULT, "memmove"), "ppu>v");
 
   // strings and ctype
   gen("strlen", "p>u");
@@ -140,6 +150,8 @@ void register_memory_imports() {
   gen("strncat", "ppu>P");
   gen("strchr", "pi>P");
   gen("strstr", "pp>P");
+  gen("strcspn", "pp>u");
+  gen("atoll", "p>q");
   gen("strpbrk", "pp>P");
   gen("strtok", "pp>P");
   gen("strlcpy", "ppu>u");
@@ -185,8 +197,10 @@ void register_memory_imports() {
   gen("towupper", "i>i");
   gen("wctype", "p>u");
   gen("iswctype", "ii>i");
-  for (const char* size :
-       {"iswalpha", "iswdigit", "iswspace", "iswupper", "iswlower", "iswalnum", "iswpunct", "iswprint", "iswxdigit"})
+  for (const char* size : {"iswalpha", "iswdigit", "iswspace", "iswupper", "iswlower", "iswalnum", "iswpunct",
+                           "iswprint", "iswxdigit", "iswcntrl"})
     gen(size, "i>i");
   hle("wcstol", import_wcstol);
+  for (const char* name : {"isxdigit", "islower"})
+    gen(name, "i>i");
 }

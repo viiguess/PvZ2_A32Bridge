@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
-"""Prepare an apktool-decoded 32-bit ARM game for a32bridge: arm64 layout plus fixes for modern Android.
+"""Prepare an apktool-decoded 32-bit ARM game for a32bridge: 64-bit layouts plus fixes for modern Android.
 
     apktool d game.apk -o decoded
-    python port_apk.py decoded build/libGame.so ported [--pin-intents com/example/BootReceiver.smali]
-    apktool b ported -o game_unsigned.apk        # then zipalign + apksign it
+    python port_apk.py decoded build_arm64/libGame.so ported --bridge build_x86_64/libGame.so \
+        [--pin-intents com/example/BootReceiver.smali]
+    apktool b -api 30 ported -o game_unsigned.apk        # then zipalign + apksign it
+    (without -api 30 the dex targets minSdk and Java 8 interface methods fail with IncompatibleClassChangeError)
 
 What it does:
-  1. lib/arm64-v8a/lib<name>.so      the bridge (the file name chooses <name>, which must match the library the
+  1. For each bridge (positional and --bridge; the ABI, arm64-v8a or x86_64, comes from the ELF header):
+     lib/<abi>/lib<name>.so          the bridge (the file name chooses <name>, which must match the library the
                                      game loads with System.loadLibrary("<name>"))
-     lib/arm64-v8a/lib<name>_a32.so  the game's original armeabi/armeabi-v7a library, which the bridge loads
+     lib/<abi>/lib<name>_a32.so      the game's original armeabi/armeabi-v7a library, which the bridge loads
+     An x86_64 bridge lets x86 emulators (MuMu, LDPlayer, WSA) run the game without their slower ARM translator.
   2. Keeps the 32-bit libraries under lib/armeabi{,-v7a}, so the same APK also installs natively on 32-bit ARM
-     devices (Android picks arm64-v8a on 64-bit devices, armeabi on 32-bit ones). With --arm64-only they are removed.
+     devices (Android picks the first ABI of the device's list that the APK has). With --arm64-only they are removed.
      Other 32-bit SDK libraries cannot be loaded into a 64-bit process, so their System.loadLibrary calls are
      redirected to "<name>" (loading an already-loaded library is a no-op) and the Java side still starts. Natives of
      those libraries are NOT available (on 32-bit devices too, because the redirect is in the Java code); code that
@@ -121,32 +125,106 @@ def original_signature_hash(decoded):
     return None
 
 
-def install_libraries(out, bridge, name, keep_32bit=True):
-    lib = os.path.join(out, 'lib')
-    arm64 = os.path.join(lib, 'arm64-v8a')
-    os.makedirs(arm64, exist_ok=True)
-    original = None
+ELF_MACHINE_ABIS = {183: 'arm64-v8a', 62: 'x86_64'}  # EM_AARCH64, EM_X86_64
+
+
+def library_abi(path):
+    """The Android ABI directory for a 64-bit library, from its ELF header."""
+    with open(path, 'rb') as f:
+        header = f.read(20)
+    if header[:4] != b'\x7fELF':
+        sys.exit('%s is not an ELF library' % path)
+    machine = int.from_bytes(header[18:20], 'little')
+    if machine not in ELF_MACHINE_ABIS:
+        sys.exit('%s: ELF machine %d; bridges and stubs must be built for arm64-v8a or x86_64' % (path, machine))
+    return ELF_MACHINE_ABIS[machine]
+
+
+def by_abi(paths):
+    """{abi: path} for libraries of different ABIs; two of the same ABI is an error."""
+    result = {}
+    for path in paths:
+        abi = library_abi(path)
+        if abi in result:
+            sys.exit('two %s libraries given: %s and %s' % (abi, result[abi], path))
+        result[abi] = path
+    return result
+
+
+def original_library(lib, name):
     for abi in ('armeabi-v7a', 'armeabi'):
         candidate = os.path.join(lib, abi, 'lib%s.so' % name)
         if os.path.exists(candidate):
-            original = candidate
-            break
+            return candidate
+    return None
+
+
+def install_mods(out, mods, abis, stubs=None):
+    """Hook libraries that patch the game at run time: shipped as lib<mod>_a32.so for the bridge to run, with the
+    empty stub ({abi: path}) under the original name so Java's loadLibrary still succeeds."""
+    lib = os.path.join(out, 'lib')
+    stubs = stubs or {}
+    for mod in mods:
+        original = original_library(lib, mod)
+        if original is None:
+            print('WARNING: mod library lib%s.so not found' % mod)
+            continue
+        for abi in abis:
+            shutil.copy(original, os.path.join(lib, abi, 'lib%s_a32.so' % mod))
+            if abi in stubs:
+                shutil.copy(stubs[abi], os.path.join(lib, abi, 'lib%s.so' % mod))
+            elif stubs:
+                print('WARNING: no %s --stub: System.loadLibrary("%s") fails on %s devices' % (abi, mod, abi))
+        print('mod library installed: lib%s_a32.so (%s)' % (mod, ', '.join(abis)))
+
+
+def pad_abi_dirs(out, abis, stubs):
+    """Puts the empty stub under every 32-bit library name missing from the bridge ABI directories. x86 emulators
+    pick the ARM ABI when lib/x86_64 lacks libraries that lib/armeabi has. Returns the number of stubs installed."""
+    lib = os.path.join(out, 'lib')
+    names = set()
+    for abi in ('armeabi', 'armeabi-v7a'):
+        if os.path.isdir(os.path.join(lib, abi)):
+            names.update(n for n in os.listdir(os.path.join(lib, abi)) if n.endswith('.so'))
+    count = 0
+    for abi in abis:
+        missing = sorted(n for n in names if not os.path.exists(os.path.join(lib, abi, n)))
+        if missing and abi not in stubs:
+            print('WARNING: no %s --stub: lib/%s lacks %s; x86 emulators may pick the 32-bit ARM libraries instead'
+                  % (abi, abi, ', '.join(missing)))
+            continue
+        for name in missing:
+            shutil.copy(stubs[abi], os.path.join(lib, abi, name))
+            count += 1
+    return count
+
+
+def install_libraries(out, bridges, name, keep_32bit=True):
+    """`bridges`: {abi: bridge library}."""
+    lib = os.path.join(out, 'lib')
+    original = original_library(lib, name)
     if original is None:
         sys.exit('no lib%s.so found under lib/armeabi{,-v7a}' % name)
-    shutil.copy(bridge, os.path.join(arm64, 'lib%s.so' % name))
-    shutil.copy(original, os.path.join(arm64, 'lib%s_a32.so' % name))
+    for abi, bridge in sorted(bridges.items()):
+        target = os.path.join(lib, abi)
+        os.makedirs(target, exist_ok=True)
+        shutil.copy(bridge, os.path.join(target, 'lib%s.so' % name))
+        shutil.copy(original, os.path.join(target, 'lib%s_a32.so' % name))
+        print('bridge installed: lib/%s/lib%s.so + lib%s_a32.so' % (abi, name, name))
     if not keep_32bit:
         for abi in ('armeabi', 'armeabi-v7a'):
             shutil.rmtree(os.path.join(lib, abi), ignore_errors=True)
 
 
 LOAD_LIBRARY = re.compile(
-    r'(const-string v\d+, )"(?!%s")[A-Za-z0-9_]+"(\s*\n\s*invoke-static \{v\d+\}, '
+    r'(const-string v\d+, )"(?!(?:%s)")[A-Za-z0-9_]+"(\s*\n\s*invoke-static \{v\d+\}, '
     r'Ljava/lang/System;->loadLibrary\(Ljava/lang/String;\)V)')
 
 
-def redirect_load_library(out, name):
-    pattern = re.compile(LOAD_LIBRARY.pattern % re.escape(name))
+def redirect_load_library(out, name, keep=()):
+    """Every System.loadLibrary("x") becomes loadLibrary("<name>"), except the names in `keep` (the mod libraries: on
+    32-bit devices the original ones load; on 64-bit devices stub libraries of the same name do)."""
+    pattern = re.compile(LOAD_LIBRARY.pattern % '|'.join(re.escape(n) for n in (name,) + tuple(keep)))
     total = 0
     for path in smali_files(out):
         text = read(path)
@@ -189,7 +267,7 @@ def service_intent_candidates(out):
     for path in smali_files(out):
         text = read(path)
         if ('startService' in text or 'bindService' in text) and INTENT_NEW.search(text):
-            found.append(os.path.relpath(path, os.path.join(out, 'smali')).replace(os.sep, '/'))
+            found.append(class_path(out, path))
     return found
 
 
@@ -197,7 +275,9 @@ def pin_service_intents(out, package, files):
     """Adds Intent.setPackage(package) after every `new Intent(String)` in service-starting methods of `files`."""
     changed = 0
     for rel in files:
-        path = os.path.join(out, 'smali', *rel.split('/'))
+        path = find_class(out, rel)
+        if path is None:
+            continue
         text = read(path)
 
         def fix(match):
@@ -302,11 +382,12 @@ def default_return(ret):
     return '    const/4 v0, 0x0\n    return v0'
 
 
-def stub_foreign_natives(out, keep=('com/popcap/', 'com/stub/', 'com/qihoo', 'com/common/busi/CustomView')):
+def stub_foreign_natives(out, keep=('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo',
+                                    'com/common/busi/CustomView')):
     """Native methods of SDK classes live in 32-bit libraries the bridge cannot load, so calling them throws
     UnsatisfiedLinkError (often on a worker thread, which kills the process). They are turned into methods that return
-    0 / null / void. Classes under the `keep` prefixes (the game itself and the packer stub) are left alone: their
-    natives are provided by the game library or the packer. Returns the number of methods stubbed."""
+    0 / null / void. Classes under the `keep` prefixes (the game, the Marmalade loader and the packer stub) are left
+    alone: their natives come from the game library or the packer. Returns the number of methods stubbed."""
     count = 0
 
     def stub(m):
@@ -344,11 +425,16 @@ def add_unpacked_dex(out, dex, baksmali):
     subprocess.run(['java', '-jar', baksmali, 'd', dex, '-o', os.path.join(out, 'smali_classes%d' % number)], check=True)
 
 
-def install_jiagu(out, bridge):
-    target = os.path.join(out, 'lib', 'arm64-v8a')
-    os.makedirs(target, exist_ok=True)
-    shutil.copy(os.path.join(out, 'assets', 'libjiagu.so'), os.path.join(target, 'libjiagu_a32.so'))
-    shutil.copy(bridge, os.path.join(out, 'assets', 'libjiagu_a64.so'))
+JIAGU_ASSETS = {'arm64-v8a': 'libjiagu_a64.so', 'x86_64': 'libjiagu_x64.so'}  # what the packer's stub loads per ABI
+
+
+def install_jiagu(out, bridges):
+    """`bridges`: {abi: bridge built with -DLIBNAME=jiagu}. The x86_64 one is untested."""
+    for abi, bridge in sorted(bridges.items()):
+        target = os.path.join(out, 'lib', abi)
+        os.makedirs(target, exist_ok=True)
+        shutil.copy(os.path.join(out, 'assets', 'libjiagu.so'), os.path.join(target, 'libjiagu_a32.so'))
+        shutil.copy(bridge, os.path.join(out, 'assets', JIAGU_ASSETS[abi]))
 
 
 # ---- Talkweb / China Unicom SDKs -------------------------------------------------------------------------------------
@@ -494,9 +580,18 @@ def main():
     parser.add_argument('--package', help="app package for service-intent pinning (default: from the manifest)")
     parser.add_argument('--pin-intents', nargs='*', default=[], metavar='SMALI',
                         help='smali files (relative to smali/) whose implicit service intents are pinned to the app')
-    parser.add_argument('--jiagu-bridge', metavar='LIB', help='bridge built with -DLIBNAME=jiagu: runs the 360 Jiagu stub')
+    parser.add_argument('--bridge', action='append', default=[], metavar='LIB', dest='bridge_extra',
+                        help='the same bridge built for another ABI (e.g. x86_64), same file name')
+    parser.add_argument('--jiagu-bridge', action='append', default=[], metavar='LIB',
+                        help='bridge built with -DLIBNAME=jiagu: runs the 360 Jiagu stub (repeatable, one per ABI)')
     parser.add_argument('--jiagu-dex', metavar='DEX', help='decrypted dex of a 360 Jiagu app, added as an extra dex')
     parser.add_argument('--baksmali', metavar='JAR', help='baksmali jar, needed with --jiagu-dex')
+    parser.add_argument('--mod', action='append', default=[], metavar='NAME',
+                        help='hook library lib<NAME>.so to run inside the bridge (repeatable; the bridge loads '
+                             'czProject, HookPVZ2 and Restart)')
+    parser.add_argument('--stub', '--mod-stub', action='append', default=[], metavar='SO', dest='stub',
+                        help='empty library built from tools/mod_stub.c, one per bridge ABI, used as a placeholder '
+                             'for --mod names and other 32-bit libraries')
     parser.add_argument('--arm64-only', action='store_true',
                         help='drop the 32-bit libraries (default: keep them so the APK also runs natively on 32-bit ARM)')
     args = parser.parse_args()
@@ -505,6 +600,10 @@ def main():
     if not (base.startswith('lib') and base.endswith('.so')):
         sys.exit('the bridge file must be named lib<name>.so')
     name = base[3:-3]
+    for extra in args.bridge_extra:
+        if os.path.basename(extra) != base:
+            sys.exit('--bridge %s: every bridge build must be named %s' % (extra, base))
+    bridges = by_abi([args.bridge] + args.bridge_extra)
 
     shutil.copytree(args.decoded, args.out, ignore=shutil.ignore_patterns('_backup'), dirs_exist_ok=True)
     sig = original_signature_hash(args.decoded)
@@ -516,8 +615,14 @@ def main():
         print('WARNING: original signature hash is %d, not the bridge default %d.\n'
               '         Rebuild the bridge with -DORIG_SIG_HASH=%d or the game will report a modified APK.'
               % (sig, DEFAULT_SIG_HASH, sig))
-    install_libraries(args.out, args.bridge, name, keep_32bit=not args.arm64_only)
-    print('loadLibrary calls redirected to "%s": %d' % (name, redirect_load_library(args.out, name)))
+    install_libraries(args.out, bridges, name, keep_32bit=not args.arm64_only)
+    stubs = by_abi(args.stub)
+    install_mods(args.out, args.mod, sorted(bridges), stubs)
+    if args.arm64_only:
+        print('32-bit libraries dropped (--arm64-only)')
+    else:
+        print('stub libraries installed for 32-bit library names: %d' % pad_abi_dirs(args.out, sorted(bridges), stubs))
+    print('loadLibrary calls redirected to "%s": %d' % (name, redirect_load_library(args.out, name, args.mod)))
     patch_apktool_yml(args.out)
     package = args.package or patch_manifest(args.out)
     if args.package:
@@ -535,7 +640,7 @@ def main():
             sys.exit('--jiagu-dex needs --baksmali')
         add_unpacked_dex(args.out, args.jiagu_dex, args.baksmali)
     if args.jiagu_bridge:
-        install_jiagu(args.out, args.jiagu_bridge)
+        install_jiagu(args.out, by_abi(args.jiagu_bridge))
     removed = remove_muzhiwan(args.out)
     if removed:
         print('Muzhiwan embed SDK removed: %d PopUtils methods turned into no-ops, game activity is the launcher' % removed)

@@ -140,7 +140,10 @@ static void import_setlocale(Ctx& ctx, const Stub&) {
 static void import_syscall(Ctx& ctx, const Stub&) {
   if (ctx.a(0) == 224)
     ctx.ret((u32)gettid());
-  else {
+  else if (ctx.a(0) == 0xf0002) {  // __ARM_NR_cacheflush(start, end, 0)
+    cpu_invalidate_range(ctx.a(1), ctx.a(2) - ctx.a(1));
+    ctx.ret(0);
+  } else {
     errno = ENOSYS;
     set_errno();
     ctx.ret(-1);
@@ -163,9 +166,10 @@ static void import_gnu_Unwind_Find_exidx(Ctx& ctx, const Stub&) {
 
 void register_misc_imports() {
   // math: arm32 softfp passes values in core registers; forward to the host libm
-  for (const char* name : {"sin",   "cos",  "tan",   "atan",  "acos",  "asin",   "sqrt",   "floor",     "ceil", "log",
-                           "log10", "exp",  "exp2",  "expm1", "log1p", "logb",   "cbrt",   "erf",       "erfc", "sinh",
-                           "cosh",  "tanh", "asinh", "acosh", "atanh", "lgamma", "tgamma", "nearbyint", "rint", "fabs"})
+  for (const char* name :
+       {"sin",   "cos",   "tan",   "atan",   "acos",   "asin",      "sqrt", "floor", "ceil", "log",  "log10",
+        "exp",   "exp2",  "expm1", "log1p",  "logb",   "cbrt",      "erf",  "erfc",  "sinh", "cosh", "tanh",
+        "asinh", "acosh", "atanh", "lgamma", "tgamma", "nearbyint", "rint", "fabs",  "round"})
     gen(name, "d>d");
   for (const char* name : {"atan2", "fmod", "pow", "hypot", "nextafter", "remainder"})
     gen(name, "dd>d");
@@ -175,6 +179,8 @@ void register_misc_imports() {
   for (const char* name : {"atan2f", "fmodf", "powf", "nextafterf"})
     gen(name, "ff>f");
   gen("modf", "dp>d");
+  gen("ldexp", "di>d");
+  gen("frexp", "dp>d");
   gen("modff", "fp>f");
   gen("lroundf", "f>i");
   gen("lrint", "d>i");

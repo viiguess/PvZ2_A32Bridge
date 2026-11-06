@@ -1,10 +1,12 @@
 // stdio, file and directory imports, plus guest-visible stdout/stderr redirected to logcat.
 #include "libc/stdio_imports.h"
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <netdb.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
@@ -109,7 +111,7 @@ static int open_flags_from_guest(u32 flags) {
 
 static void import_stat(Ctx& ctx, const Stub&) {
   struct stat info;
-  int result = stat((const char*)ctx.p(0), &info);
+  int result = stat(guest_host_path((const char*)ctx.p(0)), &info);
   set_errno();
   if (result == 0)
     stat_to_guest(info, ctx.a(1));
@@ -118,7 +120,7 @@ static void import_stat(Ctx& ctx, const Stub&) {
 
 static void import_statfs(Ctx& ctx, const Stub&) {
   struct statfs info;
-  int result = statfs((const char*)ctx.p(0), &info);
+  int result = statfs(guest_host_path((const char*)ctx.p(0)), &info);
   set_errno();
   if (result == 0) {
     uint8_t* out = (uint8_t*)H(ctx.a(1));
@@ -135,12 +137,36 @@ static void import_statfs(Ctx& ctx, const Stub&) {
 
 const char* (*g_path_hook)(const char*) = nullptr;
 
-static const char* host_path(const char* guest_path) {
-  return g_path_hook ? g_path_hook(guest_path) : guest_path;
+// System files old games open by path that current Android no longer ships: the CJK font was DroidSansFallback
+// until Android 6 and is a Noto CJK collection now.
+static const char* legacy_system_path(const char* path) {
+  static const char* const kOldCjkFonts[] = {"/system/fonts/DroidSansFallback.ttf",
+                                             "/system/fonts/DroidSansFallbackFull.ttf"};
+  static const char* const kCjkFonts[] = {
+      "/system/fonts/NotoSansCJK-Regular.ttc", "/system/fonts/NotoSansSC-Regular.otf",
+      "/system/fonts/NotoSansTC-Regular.otf", "/system/fonts/NotoSansCJKsc-Regular.otf"};
+  for (const char* old_font : kOldCjkFonts) {
+    if (strcmp(path, old_font) != 0 || access(path, R_OK) == 0)
+      continue;
+    for (const char* font : kCjkFonts)
+      if (access(font, R_OK) == 0)
+        return font;
+  }
+  return path;
+}
+
+const char* guest_host_path(const char* guest_path) {
+  return legacy_system_path(g_path_hook ? g_path_hook(guest_path) : guest_path);
+}
+
+static void import_access(Ctx& ctx, const Stub&) {
+  int result = access(guest_host_path((const char*)ctx.p(0)), (int)ctx.a(1));
+  set_errno();
+  ctx.ret(result);
 }
 
 static void import_open(Ctx& ctx, const Stub&) {
-  int result = open(host_path((const char*)ctx.p(0)), open_flags_from_guest(ctx.a(1)), ctx.a(2));
+  int result = open(guest_host_path((const char*)ctx.p(0)), open_flags_from_guest(ctx.a(1)), ctx.a(2));
   set_errno();
   ctx.ret(result);
 }
@@ -181,7 +207,7 @@ static void import_fsetpos(Ctx& ctx, const Stub&) {
 
 // FILE and dir
 static void import_fopen(Ctx& ctx, const Stub&) {
-  FILE* file = fopen(host_path((const char*)ctx.p(0)), (const char*)ctx.p(1));
+  FILE* file = fopen(guest_host_path((const char*)ctx.p(0)), (const char*)ctx.p(1));
   set_errno();
   ctx.ret(file_new(file));
 }
@@ -289,6 +315,16 @@ static void import_vsnprintf(Ctx& ctx, const Stub&) {
   put_str(ctx, ctx.a(0), ctx.a(1), format_guest((const char*)ctx.p(2), args));
 }
 
+static void import_android_log_vprint(Ctx& ctx, const Stub&) {  // (prio, tag, fmt, va_list)
+  Args args{&ctx, 0, ctx.a(3), true};
+  log_out((int)ctx.a(0), (const char*)ctx.p(1), format_guest((const char*)ctx.p(2), args));
+  ctx.ret(1);
+}
+
+static void import_noop(Ctx& ctx, const Stub&) {
+  ctx.ret(0);
+}
+
 static void import_printf(Ctx& ctx, const Stub&) {
   Args args{&ctx, 1, 0, false};
   std::string text = format_guest((const char*)ctx.p(0), args);
@@ -384,7 +420,7 @@ static void import_vsscanf(Ctx& ctx, const Stub&) {
 }
 
 static void import_opendir(Ctx& ctx, const Stub&) {
-  DIR* dir = opendir(host_path((const char*)ctx.p(0)));
+  DIR* dir = opendir(guest_host_path((const char*)ctx.p(0)));
   set_errno();
   if (!dir) {
     ctx.ret(0);
@@ -423,6 +459,49 @@ static void import_readdir_r(Ctx& ctx, const Stub&) {
   memcpy(ctx.p(1), entry, 19 + strlen(entry->d_name) + 1);
   *(u32*)ctx.p(2) = ctx.a(1);
   ctx.ret(0);
+}
+
+// gethostbyname / inet_ntoa return pointers to static storage; the guest needs 32-bit layouts in guest memory.
+// hostent (32-bit): { char* h_name; char** h_aliases; int h_addrtype; int h_length; char** h_addr_list; }
+static u32 g_hostent;  // 20-byte hostent, then name[256], aliases[1], addr_list[2], addr[4]
+static std::mutex g_hostent_mutex;
+
+static void import_gethostbyname(Ctx& ctx, const Stub&) {
+  addrinfo hints = {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* result = nullptr;
+  if (getaddrinfo((const char*)ctx.p(0), nullptr, &hints, &result) != 0 || !result) {
+    ctx.ret(0);  // h_errno is not modelled
+    return;
+  }
+  std::lock_guard<std::mutex> lock(g_hostent_mutex);
+  if (!g_hostent)
+    g_hostent = gdata_alloc(20 + 256 + 4 + 8 + 4, 8);
+  u32 name = g_hostent + 20, aliases = name + 256, list = aliases + 4, addr = list + 8;
+  strncpy((char*)H(name), (const char*)ctx.p(0), 255);
+  ((char*)H(name))[255] = 0;
+  memcpy(H(addr), &((sockaddr_in*)result->ai_addr)->sin_addr, 4);
+  freeaddrinfo(result);
+  u32* hostent = (u32*)H(g_hostent);
+  hostent[0] = name;
+  hostent[1] = aliases;
+  hostent[2] = AF_INET;
+  hostent[3] = 4;
+  hostent[4] = list;
+  *(u32*)H(aliases) = 0;
+  ((u32*)H(list))[0] = addr;
+  ((u32*)H(list))[1] = 0;
+  ctx.ret(g_hostent);
+}
+
+static void import_inet_ntoa(Ctx& ctx, const Stub&) {  // struct in_addr is passed by value: one u32
+  static u32 buffer = gdata_alloc(16, 4);
+  in_addr address;
+  address.s_addr = ctx.a(0);
+  strncpy((char*)H(buffer), inet_ntoa(address), 15);
+  ((char*)H(buffer))[15] = 0;
+  ctx.ret(buffer);
 }
 
 void register_stdio_imports() {
@@ -469,6 +548,8 @@ void register_stdio_imports() {
   hle("vsprintf", import_vsprintf);
   hle("vsnprintf", import_vsnprintf);
   hle("printf", import_printf);
+  hle("__android_log_vprint", import_android_log_vprint);
+  hle("tzset", import_noop);
   hle("vswprintf", import_vswprintf);
 
   // logging
@@ -487,7 +568,7 @@ void register_stdio_imports() {
   // files and directories
   gen("ftruncate", "ii>i");
   gen("rename", "pp>i");
-  gen("access", "pi>i");
+  hle("access", import_access);
   gen("mkdir", "pu>i");
   gen("unlink", "p>i");
   gen("rmdir", "p>i");
@@ -529,4 +610,6 @@ void register_stdio_imports() {
   gen("getsockname", "ipp>i");
   gen("gethostname", "pu>i");
   gen("inet_addr", "p>u");
+  hle("gethostbyname", import_gethostbyname);
+  hle("inet_ntoa", import_inet_ntoa);
 }

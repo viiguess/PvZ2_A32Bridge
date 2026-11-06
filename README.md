@@ -1,16 +1,18 @@
 # a32bridge
 
 Run a 32-bit ARM (armeabi / armeabi-v7a) Android game library inside a **64-bit-only** app, so old native games
-install and run on arm64-only devices and current Android versions.
+install and run on arm64-only devices, current Android versions and x86_64 emulators (MuMu, LDPlayer, WSA).
 
-The game's native library is not recompiled. A small arm64 library takes its place, loads the original ARM library
-into a private 4 GiB address space and executes it with the [Dynarmic](https://github.com/merryhime/dynarmic) JIT.
+The game's native library is not recompiled. A small arm64 or x86_64 library takes its place, loads the original ARM
+library into a private 4 GiB address space and executes it with the [Dynarmic](https://github.com/merryhime/dynarmic)
+JIT.
 Everything the game imports (libc, libm, zlib, OpenGL ES, OpenSL ES, JNI) is re-implemented on the host side.
 
 ```
    Java (ART, arm64)
         |  System.loadLibrary("Game")            lib/arm64-v8a/libGame.so        <- a32bridge
         v                                          lib/arm64-v8a/libGame_a32.so   <- the original ARM library
+        |                                          (the same pair under lib/x86_64 for x86 emulators)
  +--------------------+     svc stubs      +----------------------------+
  | guest ARM code     | -----------------> | host HLE: libc, GLES, SLES, |
  | (Dynarmic JIT)     | <----------------- | JNI facade, threads, zlib   |
@@ -45,6 +47,9 @@ Limitations worth knowing:
 | `src/jni/` | 32-bit `JNIEnv`/`JavaVM` facade: `handles` (object/method/field handles), `calls` (`Call*Method`, fields), `objects`, `strings`, `arrays`, `natives` (`RegisterNatives` trampolines), `vm`, and `bridge` (table construction and `JNI_OnLoad`) |
 | `src/opensles.*` | OpenSL ES interfaces as guest vtables over the host objects |
 | `src/jni/game_exports.cpp` | JNI exports the VM resolves by name rather than via `RegisterNatives` (game specific) |
+| `src/runtime/softfloat_accel.*` | armeabi games do all float math through libgcc helpers (`__aeabi_fadd`, ...) that emulate it with integer code. They are replaced by VFP versions (`tools/softfloat_vfp.S`, built into `softfloat_vfp.h` by `tools/gen_softfloat_vfp.py`) that the JIT turns into single host FP instructions: about 2.5x the frame rate on busy screens |
+| `src/runtime/mods.*` | Hook libraries the game loads next to its main library (`libczProject.so` and co.) run in the guest too (`--mod` in `port_apk.py`) |
+| `src/libc/compat_imports.cpp` | Imports only old games take from the system (libgcc division helpers, old libstdc++ `new`/`delete`) |
 
 A guest address is converted to a host pointer by adding one base (`G + addr`), so memory access inside the JIT is
 a plain load/store and host code can read guest buffers directly.
@@ -68,6 +73,9 @@ tools/init_boost.sh                                    # only the ~20 Boost libr
 cmake -B build -G Ninja \n  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \n  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \n  -DLIBNAME=Game
 cmake --build build          # -> build/libGame.so
 ```
+
+For x86 emulators, build it a second time with `-DANDROID_ABI=x86_64` (e.g. into `build_x86_64`). The emulator then
+runs the bridge natively instead of putting the arm64 bridge through its ARM translator, which is several times slower.
 
 Third-party code:
 
@@ -96,9 +104,12 @@ Options:
 2. Build the bridge with `-DLIBNAME=<name>`, where `<name>` is the argument the game passes to `System.loadLibrary`.
 3. Prepare the app:
    ```sh
-   python tools/port_apk.py decoded build/lib<name>.so ported
+   python tools/port_apk.py decoded build/lib<name>.so ported --bridge build_x86_64/lib<name>.so
    ```
-   This installs `lib<name>.so` (the bridge) and `lib<name>_a32.so` (the original) under `lib/arm64-v8a`, **keeps the
+   This installs `lib<name>.so` (the bridge) and `lib<name>_a32.so` (the original) under `lib/arm64-v8a`, and under
+   `lib/x86_64` for the optional `--bridge` build (the ABI comes from the ELF header). Pass `--stub` once per ABI (an
+   empty library built from `tools/mod_stub.c`): it fills in the other 32-bit library names, without which x86
+   emulators pick the ARM libraries. It **keeps the
    original 32-bit libraries** so the same APK also runs natively on 32-bit ARM devices (`--arm64-only` drops them),
    redirects the other libraries' `System.loadLibrary` calls, and adjusts SDK levels and the manifest. Signature
    checks are answered by the bridge itself (`ORIG_SIG_HASH`, which defaults to the PopCap/EA certificate hash
@@ -106,7 +117,8 @@ Options:
    APK's original signature and warns if it differs; then rebuild the bridge with `-DORIG_SIG_HASH=<value>`. Read its
    output: it lists implicit service intents that Android 5+ rejects; pin the ones that belong to the app with
    `--pin-intents`.
-4. `apktool b ported -o game.apk`, then `zipalign` and sign it.
+4. `apktool b -api 30 ported -o game.apk`, then `zipalign` and sign it. Without `-api 30` the dex targets the
+   manifest's `minSdkVersion` and AndroidX/Kotlin code fails with `IncompatibleClassChangeError`.
 
 `port_apk.py` also prepares the SDKs inside the APK for a 64-bit process and modern Android: native methods of SDK
 classes (payment, analytics, ...) are stubbed to return 0/null/void instead of throwing `UnsatisfiedLinkError`, and the
@@ -121,7 +133,8 @@ runs the packer's library the same way it runs the game's:
 
 1. Build a second bridge with `-DLIBNAME=jiagu`. The stub copies `assets/libjiagu_a64.so` out of the APK on 64-bit
    devices and loads it, so this bridge takes that place. The packer's own library becomes the guest,
-   `lib/arm64-v8a/libjiagu_a32.so`, and the bridge finds it through the app's native library directory.
+   `lib/arm64-v8a/libjiagu_a32.so`, and the bridge finds it through the app's native library directory. An x86_64
+   jiagu bridge goes to `assets/libjiagu_x64.so` (untested).
 2. Run `tools/jiagu_run` on the original library to get the decrypted dex (`classes_unpacked.dex`). The bridge cannot
    hand a dex to ART the way the packer does on an old Android, so the classes are added to the app as an extra dex.
 3. Port with `port_apk.py ... --jiagu-bridge libjiagu.so --jiagu-dex classes_unpacked.dex --baksmali baksmali.jar`.

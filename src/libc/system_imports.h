@@ -2,6 +2,8 @@
 // parts of Android's runtime a packer inspects (/proc/self/maps, raw system calls, ART's DexFile).
 #pragma once
 
+#include <string>
+
 #include "common.h"
 
 void register_system_imports();
@@ -10,6 +12,11 @@ void register_system_imports();
 // read the real file to look for emulators and debuggers, and a 64-bit process looks like neither a 32-bit device nor
 // a normal one. Call after the guest library is loaded.
 void install_fake_proc_maps();
+// Lists a companion library (a mod loaded next to the guest) in the synthetic /proc/self/maps as well.
+struct Image;
+void fake_proc_maps_add(const Image& image);
+// The name the guest sees for a library path: lib<name>_a32.so -> lib<name>.so.
+std::string shown_name(const std::string& path);
 
 // Emulates the Linux system calls the guest issues with a raw `svc #0` (syscalls.cpp), for code that bypasses libc.
 void install_syscalls();

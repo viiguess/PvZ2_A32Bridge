@@ -18,6 +18,8 @@
 #include "libc/system_imports.h"
 #include "opensles.h"
 #include "runtime/live_patch.h"
+#include "runtime/mods.h"
+#include "runtime/softfloat_accel.h"
 
 // A JNIEnv is a pointer to a table of 235 function pointers; unimplemented slots log when called.
 static constexpr int JNI_TABLE_SIZE = 235;
@@ -60,7 +62,11 @@ static std::string native_library_dir() {
     char* apk = path ? strstr(path, "/base.apk") : nullptr;
     if (apk) {
       result.assign(path, apk - path);
+#if defined(__x86_64__)
+      result += "/lib/x86_64";
+#else
       result += "/lib/arm64";
+#endif
       break;
     }
   }
@@ -101,6 +107,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
   if (!load_elf(path.c_str(), g_main))
     return JNI_ERR;
   LOG("elf loaded, %zu init fns", g_main.init.size());
+  accelerate_soft_float(g_main);
   install_fake_proc_maps();
   install_syscalls();
   apply_live_patches(g_main);
@@ -109,8 +116,11 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
 
   u32 on_load = image_sym(g_main, "JNI_OnLoad");
   LOG("payload loaded at %08x, guest JNI_OnLoad=%08x", g_main.base, on_load);
-  if (!on_load)
-    return JNI_VERSION_1_6;
-  u32 args[2] = {jni_guest_vm(), 0};
-  return (jint)guest_callv(on_load, args, 2, nullptr);
+  jint version = JNI_VERSION_1_6;
+  if (on_load) {
+    u32 args[2] = {jni_guest_vm(), 0};
+    version = (jint)guest_callv(on_load, args, 2, nullptr);
+  }
+  mods_load(path.substr(0, path.rfind('/')), jni_guest_vm());
+  return version;
 }

@@ -8,15 +8,18 @@
 
 #include <utility>
 
+#include "libc/compat_imports.h"
 #include "libc/forward.h"
 #include "libc/gles_imports.h"
 #include "libc/memory_imports.h"
 #include "libc/misc_imports.h"
-#include "libc/system_imports.h"
 #include "libc/pthread_imports.h"
 #include "libc/stdio_imports.h"
+#include "libc/system_imports.h"
 #include "libc/time_imports.h"
 #include "libc/zlib_imports.h"
+#include "runtime/mods.h"
+#include "runtime/softfloat_accel.h"
 
 // ctype tables in the layout of old bionic headers: _ctype_[c + 1] bit flags, plus tolower/toupper tables.
 // The three symbols the guest imports are *pointer variables* to the tables, not the tables themselves.
@@ -73,6 +76,8 @@ void libc_init() {
   sym_add_asm("setjmp", setjmp_code, 4);
   sym_add_asm("longjmp", longjmp_code, 6);
 
+  register_compat_imports();
+  export_soft_float_helpers();
   register_memory_imports();
   register_misc_imports();
   register_system_imports();
@@ -81,4 +86,5 @@ void libc_init() {
   register_pthread_imports();
   register_zlib_imports();
   register_gles_imports();
+  mods_register_imports();
 }

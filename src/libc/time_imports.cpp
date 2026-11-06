@@ -98,6 +98,27 @@ static void localtime_gmtime(Ctx& ctx, const Stub& stub) {
   ctx.ret(g_tm_buf);
 }
 
+static void localtime_gmtime_r(Ctx& ctx, const Stub& stub) {  // (const time_t*, struct tm*)
+  time_t time_value = (int32_t) * (u32*)ctx.p(0);
+  struct tm calendar;
+  if (!strcmp(stub.name, "gmtime_r"))
+    gmtime_r(&time_value, &calendar);
+  else
+    localtime_r(&time_value, &calendar);
+  tm_to_guest(&calendar, ctx.a(1));
+  ctx.ret(ctx.a(1));
+}
+
+static void import_clock_getres(Ctx& ctx, const Stub&) {
+  timespec resolution;
+  int result = clock_getres((clockid_t)ctx.a(0), &resolution);
+  if (ctx.a(1)) {
+    ((u32*)ctx.p(1))[0] = (u32)resolution.tv_sec;
+    ((u32*)ctx.p(1))[1] = (u32)resolution.tv_nsec;
+  }
+  ctx.ret(result);
+}
+
 static void import_mktime(Ctx& ctx, const Stub&) {
   struct tm calendar;
   tm_from_guest(ctx.a(0), &calendar);
@@ -157,6 +178,9 @@ void register_time_imports() {
   hle("clock_gettime", import_clock_gettime);
   hle("nanosleep", import_nanosleep);
   hle("localtime", localtime_gmtime);
+  hle("localtime_r", localtime_gmtime_r);
+  hle("gmtime_r", localtime_gmtime_r);
+  hle("clock_getres", import_clock_getres);
   hle("gmtime", localtime_gmtime);
   hle("mktime", import_mktime);
   hle("ctime", import_ctime);

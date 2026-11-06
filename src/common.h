@@ -36,6 +36,7 @@ enum : u32 {
   DATA_SIZE = 0x00400000,
   RET_ADDR = STUB_BASE,   // sentinel return address: a guest function returning here hands control back to the host
   IMG_BASE = 0x10000000,  // the guest library is loaded here
+  MOD_BASE = 0x1E000000,  // companion hook libraries (mods), 1 MiB aligned
   HEAP_BASE = 0x30000000,
   HEAP_END = 0x80000000,
   KUSER_BASE = 0xFFFF0000,  // Linux "kuser helper" page (see symbols.cpp)
