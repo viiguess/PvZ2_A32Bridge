@@ -50,7 +50,14 @@ static u32 round_size(u32 size) {
     return (size + 7) & ~7u;
   if (size <= 65536)
     return (size + 255) & ~255u;
-  return (size + 4095) & ~4095u;
+  if (size <= (1u << 20))
+    return (size + 4095) & ~4095u;
+  // Large blocks come in 8 sizes per power of two, so that the many differently sized buffers a game allocates (and
+  // frees) can be reused by each other; the free lists are exact-size and the heap never coalesces.
+  u32 top = 31 - __builtin_clz(size - 1);  // the power of two below `size`
+  u32 step = (1u << top) / 8;
+  u64 rounded = ((u64)size + step - 1) / step * step;
+  return rounded > 0xfffff000u ? (size + 4095) & ~4095u : (u32)rounded;
 }
 
 // block layout: [usable size u32][base u32][ user data ... ]; user ptr is 8-aligned
@@ -64,11 +71,22 @@ u32 gmalloc(u32 size) {
     blocks.pop_back();
   } else {
     if (g_heap_next + rounded + 8 > HEAP_END || g_heap_next + rounded + 8 < g_heap_next) {
-      LOG("guest heap exhausted: req=%u next=%08x", size, g_heap_next);
-      return 0;
+      // Out of fresh address space: take the smallest free block that is big enough (it keeps its own size)
+      u32 best = 0;
+      for (auto& entry : g_free)
+        if (entry.first >= rounded && !entry.second.empty() && (!best || entry.first < best))
+          best = entry.first;
+      if (!best) {
+        LOG("guest heap exhausted: req=%u next=%08x", size, g_heap_next);
+        return 0;
+      }
+      ptr = g_free[best].back();
+      g_free[best].pop_back();
+      rounded = best;
+    } else {
+      ptr = g_heap_next + 8;
+      g_heap_next += rounded + 8;
     }
-    ptr = g_heap_next + 8;
-    g_heap_next += rounded + 8;
   }
   ((u32*)(G + ptr))[-2] = rounded;
   ((u32*)(G + ptr))[-1] = ptr;

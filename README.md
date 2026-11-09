@@ -155,6 +155,7 @@ and login SDKs) still cannot run; `port_apk.py` makes the Chinese Plants vs. Zom
 | Tool | Purpose |
 | --- | --- |
 | `tools/port_apk.py` | Prepares a decoded APK for the bridge (see above); `port_apk.py finish` restores the packed dex of a packed game |
+| `tools/install_ids/` | Java helper that `port_apk.py` adds to the APK: gives games that hash `IMEI + MAC` into a device id a per-device value instead of the empty IMEI / masked MAC of Android 10+ |
 | `tools/jiagu_run/` | Runs a 32-bit library, for example a packer stub such as 360 Jiagu, with a fake JNI environment, to study or unpack it without running the app (Linux/WSL host, or the device through `adb shell`; see its README) |
 
 ## Debugging

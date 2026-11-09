@@ -126,6 +126,13 @@ static void import_compress(
   ctx.ret((u32)result);
 }
 
+static void import_compress2(Ctx& ctx, const Stub&) {  // compress2(dest, uLongf* destLen, src, srcLen, level)
+  uLongf size = *(u32*)ctx.p(1);
+  int result = compress2((Bytef*)ctx.p(0), &size, (const Bytef*)ctx.p(2), ctx.a(3), (int)ctx.a(4));
+  *(u32*)ctx.p(1) = (u32)size;
+  ctx.ret((u32)result);
+}
+
 static void import_uncompress(Ctx& ctx, const Stub&) {
   uLongf size = *(u32*)ctx.p(1);
   int result = uncompress((Bytef*)ctx.p(0), &size, (const Bytef*)ctx.p(2), ctx.a(3));
@@ -146,6 +153,7 @@ void register_zlib_imports() {
   hle("deflateReset", zlib_op<7>);
   hle("deflateInit_", zlib_op<8>);
   hle("compress", import_compress);
+  hle("compress2", import_compress2);
   hle("uncompress", import_uncompress);
   gen("crc32", "upu>u");
   gen("adler32", "upu>u");

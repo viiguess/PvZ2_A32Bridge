@@ -163,6 +163,8 @@ void register_memory_imports() {
   gen("isspace", "i>i");
   gen("isupper", "i>i");
   gen("isblank", "i>i");
+  for (const char* name : {"isalpha", "isalnum", "iscntrl", "ispunct", "isprint", "isgraph", "isdigit"})
+    gen(name, "i>i");
   gen("tolower", "i>i");
   gen("toupper", "i>i");
   for (const char* size : {"strtol", "strtoul", "strtoll", "strtoull"})

@@ -258,15 +258,29 @@ static void import_puts(Ctx& ctx, const Stub&) {
   ctx.ret(1);
 }
 
-static void import_fprintf(Ctx& ctx, const Stub&) {
-  Args args{&ctx, 2, 0, false};
-  std::string text = format_guest((const char*)ctx.p(1), args);
-  u32 guest_file = ctx.a(0);
+static void import_putchar(Ctx& ctx, const Stub&) {
+  char text[2] = {(char)ctx.a(0), 0};
+  log_out(ANDROID_LOG_INFO, "a32.stdio", text);
+  ctx.ret(ctx.a(0) & 0xff);
+}
+
+// Writes formatted text to a guest FILE: stdout / stderr go to the log, other streams to the host file.
+static void write_formatted(Ctx& ctx, u32 guest_file, const std::string& text) {
   if (std_stream_of(guest_file) > STD_IN)
     log_out(ANDROID_LOG_INFO, "a32.stdio", text);
   else
     fwrite(text.data(), 1, text.size(), file_host(guest_file));
   ctx.ret((u32)text.size());
+}
+
+static void import_fprintf(Ctx& ctx, const Stub&) {
+  Args args{&ctx, 2, 0, false};
+  write_formatted(ctx, ctx.a(0), format_guest((const char*)ctx.p(1), args));
+}
+
+static void import_vfprintf(Ctx& ctx, const Stub&) {  // (FILE*, fmt, va_list)
+  Args args{&ctx, 0, ctx.a(2), true};
+  write_formatted(ctx, ctx.a(0), format_guest((const char*)ctx.p(1), args));
 }
 
 static void import_android_log_print(Ctx& ctx, const Stub&) {
@@ -517,6 +531,8 @@ void register_stdio_imports() {
   hle("fputc", import_fputc);
   hle("puts", import_puts);
   hle("fprintf", import_fprintf);
+  hle("vfprintf", import_vfprintf);
+  hle("putchar", import_putchar);
   hle("fsetpos", import_fsetpos);
   hle("fdopen", import_fdopen);
   hle("setvbuf", [](Ctx& ctx, const Stub&) { ctx.ret(0); });  // buffering stays with the host FILE

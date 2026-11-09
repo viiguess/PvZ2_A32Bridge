@@ -33,6 +33,10 @@ What it does:
      (com/popcap), and the packer stub (com/stub, com/qihoo), keep theirs.
   7. Guards TelephonyManager.getDeviceId / getImei / getSubscriberId / getSimSerialNumber / getMeid / getLine1Number,
      which throw SecurityException on Android 10+, so that SDKs calling them at start-up do not crash.
+     Games that hash "IMEI + MAC" into a device id would give every Android 10+ device the same id (the IMEI is
+     empty and the MAC is the constant 02:00:00:00:00:00), so an empty getDeviceId / getImei and a masked
+     WifiInfo.getMacAddress are replaced by values derived from the device's ANDROID_ID (tools/install_ids). The id
+     survives restarts and reinstalls and only changes on a factory reset or when the APK's signing key changes.
   8. 360 Jiagu packed games (--jiagu-bridge, --jiagu-dex, --baksmali): see "Packed games" in the README. After
      apktool has rebuilt the APK, `port_apk.py finish original.apk rebuilt.apk output.apk` puts the packed classes.dex
      and the ZIP comment back; then zipalign and sign.
@@ -331,15 +335,59 @@ SAFE_IDS_METHOD = '''\
 '''
 
 
+# getDeviceId / getImei: a missing IMEI (Android 10+) is replaced by one derived from the device id (InstallIds)
+SAFE_IMEI_METHOD = '''.method public static {helper}(L{tm};)Ljava/lang/String;
+    .locals 1
+    :try_start
+    invoke-virtual {{p0}}, L{tm};->{method}()Ljava/lang/String;
+    move-result-object v0
+    :try_end
+    .catch Ljava/lang/Throwable; {{:try_start .. :try_end}} :handler
+    :done
+    invoke-static {{v0}}, Lcom/a32/InstallIds;->imei(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v0
+    return-object v0
+    :handler
+    const/4 v0, 0x0
+    goto :done
+.end method
+'''
+
+# WifiInfo.getMacAddress: Android masks the MAC (02:00:00:00:00:00) for apps; InstallIds supplies a per-device one
+WIFI = 'Landroid/net/wifi/WifiInfo;'
+WIFI_MAC_CALL = re.compile(r'invoke-virtual \{([^}]*)\}, %s->getMacAddress\(\)Ljava/lang/String;' % WIFI)
+SAFE_MAC_METHOD = '''.method public static wifiMac(%s)Ljava/lang/String;
+    .locals 1
+    :try_start
+    invoke-virtual {p0}, %s->getMacAddress()Ljava/lang/String;
+    move-result-object v0
+    :try_end
+    .catch Ljava/lang/Throwable; {:try_start .. :try_end} :handler
+    :done
+    invoke-static {v0}, Lcom/a32/InstallIds;->mac(Ljava/lang/String;)Ljava/lang/String;
+    move-result-object v0
+    return-object v0
+    :handler
+    const/4 v0, 0x0
+    goto :done
+.end method
+''' % (WIFI, WIFI)
+# generated from tools/install_ids/src by tools/install_ids/build.sh
+INSTALL_IDS_SMALI = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'install_ids', 'InstallIds.smali')
+
+
 def safe_ids_method(method, with_slot):
+    if method in ('getDeviceId', 'getImei') and not with_slot:
+        return SAFE_IMEI_METHOD.format(helper=GUARDED_TELEPHONY[method], tm=TELEPHONY[1:-1], method=method)
     return SAFE_IDS_METHOD.format(
         helper=GUARDED_TELEPHONY[method] + ('Slot' if with_slot else ''), tm=TELEPHONY[1:-1], method=method,
         param='I' if with_slot else '', regs='p0, p1' if with_slot else 'p0')
 
 
 def guard_identifier_calls(out):
-    """Rewrites the calls and adds the helper class. Returns the number of calls rewritten."""
+    """Rewrites the calls and adds the helper classes (SafeIds, InstallIds). Returns the number of calls rewritten."""
     used = set()  # (method, with_slot) pairs that need a helper
+    wifi_used = False
 
     def rewrite(m):
         used.add((m.group(2), bool(m.group(3))))
@@ -350,17 +398,25 @@ def guard_identifier_calls(out):
     count = 0
     for path in smali_files(out):
         text = read(path)
-        if TELEPHONY + '->' not in text:
+        if TELEPHONY + '->' not in text and WIFI + '->' not in text:
             continue
         new, n = TELEPHONY_CALL.subn(rewrite, text)
-        if n:
+        new, macs = WIFI_MAC_CALL.subn(
+            lambda m: 'invoke-static {%s}, L%s;->wifiMac(%s)Ljava/lang/String;' % (m.group(1), SAFE_IDS_CLASS, WIFI), new)
+        if n or macs:
             write(path, new)
-            count += n
-    if used:
+            count += n + macs
+            wifi_used |= bool(macs)
+    if used or wifi_used:
         path = os.path.join(smali_dirs(out)[-1], SAFE_IDS_CLASS + '.smali')  # last dex: the first may be a packed stub
         os.makedirs(os.path.dirname(path), exist_ok=True)
         header = '.class public L%s;\n.super Ljava/lang/Object;\n\n' % SAFE_IDS_CLASS
-        write(path, header + '\n'.join(safe_ids_method(method, slot) for method, slot in sorted(used)))
+        methods = [safe_ids_method(method, slot) for method, slot in sorted(used)]
+        if wifi_used:
+            methods.append(SAFE_MAC_METHOD)
+        write(path, header + '\n'.join(methods))
+        install_ids = os.path.join(os.path.dirname(path), 'InstallIds.smali')  # com/a32, next to SafeIds
+        shutil.copyfile(INSTALL_IDS_SMALI, install_ids)
     return count
 
 
@@ -649,7 +705,7 @@ def main():
         print('Talkweb/Unicom SDK patches: %d Unicom call(s) guarded, Talkweb init %s'
               % (guarded, 'skipped' if skipped else 'left alone'))
     print('SDK native methods stubbed: %d' % stub_foreign_natives(args.out))
-    print('telephony identifier calls guarded: %d' % guard_identifier_calls(args.out))
+    print('telephony / Wi-Fi identifier calls rewritten: %d' % guard_identifier_calls(args.out))
     print('ported ->', args.out)
 
 

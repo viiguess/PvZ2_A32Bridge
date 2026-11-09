@@ -148,8 +148,8 @@ uint64_t java_call(const MethodId& m, u32 self) {
   char ret;
   signature_args(m.sig, ret);
 
-  if (n == "getPackageName")
-    return new_string(g_cfg.package);
+  if (n == "getPackageName" || n == "currentPackageName" || n == "currentProcessName")
+    return new_string(g_cfg.package);  // the newest packers ask ActivityThread, and stall when it answers null
   if (n == "getApplicationInfo")
     return new_instance("android/content/pm/ApplicationInfo");
   // The packer stub (com.stub.StubApp) keeps where it unpacked its library in static fields and hands them back.
