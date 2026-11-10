@@ -240,6 +240,15 @@ static void do_call(Ctx& ctx, int kind, int source, int return_type, bool is_new
       jni->ExceptionClear();  // fall through to the real answer
     }
   }
+  // Old Jiagu packers (<= Lenovo 2.2.x) reopen the APK with DexFile.loadDex and wrap it in a DexPathList.Element that they
+  // add to the class loader. The decrypted classes are already in the loader (dexload.cpp); on Android 12 the extra,
+  // packer-patched element makes ART crash in FindClass, so the call answers with a spare DexFile.
+  if (kind == CALL_STATIC && method.name == "loadDex" && method.sig == "(Ljava/lang/String;Ljava/lang/String;I)Ldalvik/system/DexFile;") {
+    LOG("DexFile.loadDex replaced by a spare DexFile");
+    jobject spare = dexload_spare_dexfile();
+    ctx.ret(spare ? href(spare, REF_LOCAL) : 0);
+    return;
+  }
   t_last_call = method.name + method.sig;
   ArgReader reader{&ctx, arg_index, 0, source};
   if (source != ARGS_VARIADIC)
@@ -347,6 +356,19 @@ static void access_field(Ctx& ctx, const Stub& stub) {
     LOG("field access with null %s, skipped", field_id ? "object" : "id");
     ctx.ret(0);
     return;
+  }
+  if (is_set && !is_static && type == T_OBJECT) {
+    // Old Jiagu packers replace the mCookie of a java DexFile with an array that points at their fake art::DexFile, which
+    // ART would follow as a native pointer (crash in FindClass). The decrypted classes are already in the loader.
+    jclass dex_file_class = jni->FindClass("dalvik/system/DexFile");
+    bool is_dex_file = dex_file_class && jni->IsInstanceOf(object, dex_file_class);
+    if (jni->ExceptionCheck())
+      jni->ExceptionClear();
+    if (is_dex_file) {
+      LOG("SetObjectField on a DexFile dropped");
+      ctx.ret(0);
+      return;
+    }
   }
   ArgReader reader{&ctx, 3, 0, ARGS_VARIADIC};
 #define FIELD(T, ctype, get_result, set_value)                                                                       \

@@ -123,6 +123,18 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
     std::string dir = native_library_dir();
     if (!dir.empty())
       path = dir + "/lib" A32_LIBNAME "_a32.so";
+    // An arm64 bridge started by an x86_64 device (ARM translation) is told "lib/arm64", but the package manager only
+    // extracted the primary ABI's directory. The guest library is the same 32-bit ARM file in every ABI directory.
+    if (access(path.c_str(), R_OK) != 0 && !dir.empty()) {
+      std::string parent = dir.substr(0, dir.rfind('/'));
+      for (const char* abi : {"x86_64", "arm64-v8a", "arm64", "x86"}) {
+        std::string candidate = parent + "/" + abi + "/lib" A32_LIBNAME "_a32.so";
+        if (access(candidate.c_str(), R_OK) == 0) {
+          path = candidate;
+          break;
+        }
+      }
+    }
   }
   LOG("loading %s", path.c_str());
   if (!load_elf(path.c_str(), g_main))
@@ -130,6 +142,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
   LOG("elf loaded, %zu init fns", g_main.init.size());
   accelerate_soft_float(g_main);
   install_fake_proc_maps();
+  jiagu_compat_init();
   install_syscalls();
   apply_live_patches(g_main);
   for (u32 constructor : g_main.init)

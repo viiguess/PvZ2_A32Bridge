@@ -19,6 +19,13 @@ static void find_class(Ctx& ctx, const Stub&) {
   ctx.ret(href(cls, 1));
 }
 
+static void alloc_object(Ctx& ctx, const Stub&) {
+  jobject object = env()->AllocObject((jclass)hobj(ctx.a(1)));
+  if (!object)
+    env()->ExceptionClear();
+  ctx.ret(href(object, 1));
+}
+
 static void get_object_class(Ctx& ctx, const Stub&) {
   ctx.ret(href(env()->GetObjectClass(hobj(ctx.a(1))), 1));
 }
@@ -132,6 +139,7 @@ void register_object_imports(u32* table) {
   jni_set(table, 21, "NewGlobalRef", new_global_ref);
   jni_set(table, 22, "DeleteGlobalRef", delete_global_ref);
   jni_set(table, 23, "DeleteLocalRef", delete_local_ref);
+  jni_set(table, 27, "AllocObject", alloc_object);
   jni_set(table, 24, "IsSameObject", is_same_object);
   jni_set(table, 25, "NewLocalRef", new_local_ref);
   jni_set(table, 26, "EnsureLocalCapacity", jni_return_zero);

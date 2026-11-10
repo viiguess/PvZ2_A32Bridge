@@ -176,7 +176,7 @@ static std::vector<void*> make_pool(std::index_sequence<K...>) {
   return {(void*)trampI<K>..., (void*)trampF<K>..., (void*)trampD<K>...};
 }
 
-static const int NSLOT = 192;
+static const int NSLOT = 768;
 static std::vector<void*> g_pool = make_pool(std::make_index_sequence<NSLOT>());  // [I..., F..., D...]
 
 static void register_natives(Ctx& ctx, const Stub&) {
@@ -198,11 +198,17 @@ static void register_natives(Ctx& ctx, const Stub&) {
       ctx.ret(-1);
       return;
     }
+    LOG("RegisterNatives #%d %s %s", slot_index, name, sig);
     char return_type = strchr(sig, ')')[1];
     void* fn = g_pool[(return_type == 'F' ? NSLOT : return_type == 'D' ? 2 * NSLOT : 0) + slot_index];
     JNINativeMethod native_method = {const_cast<char*>(name), const_cast<char*>(sig), fn};
-    if (jni->RegisterNatives(cls, &native_method, 1) != JNI_OK)
+    if (jni->RegisterNatives(cls, &native_method, 1) != JNI_OK) {
       LOG("RegisterNatives failed: %s %s", name, sig);
+      // A packer binds natives to methods that port_apk.py already gave a Java body (--unhollow): ART throws
+      // NoSuchMethodError for them, which must not stay pending until System.load returns.
+      if (jni->ExceptionCheck())
+        jni->ExceptionClear();
+    }
   }
   ctx.ret(0);
 }

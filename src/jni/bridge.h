@@ -4,6 +4,7 @@
 // ARM library (lib<name>_a32.so, next to this one), run its constructors, then forward JNI_OnLoad to it.
 #pragma once
 
+#include <jni.h>
 #include <string>
 
 #include "common.h"
@@ -22,3 +23,5 @@ void register_array_imports(u32* table);   // arrays and direct buffers
 void register_native_imports(u32* table);  // RegisterNatives
 void register_vm_imports(u32* table);      // GetJavaVM
 u32 make_vm_table();                       // vtable of the guest JavaVM
+void jiagu_compat_init();                    // fake libart / OAT version for old Jiagu packers (jiagu_compat.cpp)
+jobject dexload_spare_dexfile();                // dexload.cpp: a harmless DexFile for old packers

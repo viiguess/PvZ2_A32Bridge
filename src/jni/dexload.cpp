@@ -10,10 +10,12 @@
 // lib/<abi>/liba32dex<N>.so. When they exist they are loaded instead of what the packer hands over.
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
 
 #include <string>
 #include <vector>
 
+#include "jni/bridge.h"
 #include "jni/handles.h"
 #include "libc/system_imports.h"
 
@@ -55,6 +57,9 @@ static bool set_reflect_field(JNIEnv* jni, jclass owner, jobject object, const c
   return !clear_exception(jni, "Field.set");
 }
 
+static jobject g_spare_dexfile = nullptr;  // global ref: the DexFile of the smallest in-memory dex
+static u32 g_spare_size = 0;
+
 static void load_dex_into_app_loader(const uint8_t* dex, u32 size);
 
 static void load_shipped_dex(const uint8_t* dex, u32 size) {
@@ -67,6 +72,19 @@ static std::vector<std::string> shipped_dex_files() {
   std::string dir = native_library_dir();
   if (dir.empty())
     return files;
+  // An arm64 bridge started by an x86_64 device is told "lib/arm64", but only the primary ABI's directory exists.
+  std::string probe = dir + "/liba32dex2.so";
+  if (access(probe.c_str(), R_OK) != 0) {
+    std::string parent = dir.substr(0, dir.rfind('/'));
+    for (const char* abi : {"x86_64", "arm64-v8a", "arm64", "x86"}) {
+      std::string candidate = parent + "/" + abi;
+      std::string file = candidate + "/liba32dex2.so";
+      if (access(file.c_str(), R_OK) == 0) {
+        dir = candidate;
+        break;
+      }
+    }
+  }
   for (int n = 2; n < 10; n++) {
     char name[32];
     snprintf(name, sizeof name, "/liba32dex%d.so", n);
@@ -116,27 +134,72 @@ static void load_dex_into_app_loader(const uint8_t* dex, u32 size) {
   uint8_t* copy = (uint8_t*)malloc(size);  // kept for the life of the process: the loader maps the buffer
   memcpy(copy, dex, size);
   jobject buffer = jni->NewDirectByteBuffer(copy, size);
-  jclass imcl_class = jni->FindClass("dalvik/system/InMemoryDexClassLoader");
-  jobject imcl = jni->NewObject(imcl_class,
-                                jni->GetMethodID(imcl_class, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"), buffer,
-                                app_loader);
-  if (clear_exception(jni, "InMemoryDexClassLoader") || !imcl) {
-    jni->PopLocalFrame(nullptr);
-    return;
-  }
 
   jclass base_loader = jni->FindClass("dalvik/system/BaseDexClassLoader");
   jclass path_list_class = jni->FindClass("dalvik/system/DexPathList");
   jobject app_list = reflect_field(jni, base_loader, app_loader, "pathList");
-  jobject new_list = reflect_field(jni, base_loader, imcl, "pathList");
   jobjectArray app_elements = app_list ? (jobjectArray)reflect_field(jni, path_list_class, app_list, "dexElements") : nullptr;
-  jobjectArray new_elements = new_list ? (jobjectArray)reflect_field(jni, path_list_class, new_list, "dexElements") : nullptr;
+
+  // Preferred: DexPathList.makeInMemoryDexElements(ByteBuffer[], List) builds Elements that are not tied to any class
+  // loader yet, so the app loader can define the classes. (An InMemoryDexClassLoader registers the dex with itself and
+  // ART then refuses "multiple class loaders" when the app loader defines a class from it.)
+  jobjectArray new_elements = nullptr;
+  {
+    jclass class_class2 = jni->FindClass("java/lang/Class");
+    jclass method_class = jni->FindClass("java/lang/reflect/Method");
+    jclass bb_class = jni->FindClass("java/nio/ByteBuffer");
+    jclass list_iface = jni->FindClass("java/util/List");
+    jclass arraylist = jni->FindClass("java/util/ArrayList");
+    jobjectArray param_types = jni->NewObjectArray(2, class_class2, nullptr);
+    jclass bb_array_class = jni->FindClass("[Ljava/nio/ByteBuffer;");
+    jni->SetObjectArrayElement(param_types, 0, bb_array_class);
+    jni->SetObjectArrayElement(param_types, 1, list_iface);
+    jobject method = jni->CallObjectMethod(
+        path_list_class,
+        jni->GetMethodID(class_class2, "getDeclaredMethod", "(Ljava/lang/String;[Ljava/lang/Class;)Ljava/lang/reflect/Method;"),
+        jni->NewStringUTF("makeInMemoryDexElements"), param_types);
+    if (!clear_exception(jni, "getDeclaredMethod makeInMemoryDexElements") && method) {
+      jni->CallVoidMethod(method, jni->GetMethodID(method_class, "setAccessible", "(Z)V"), JNI_TRUE);
+      jobjectArray buffers = jni->NewObjectArray(1, bb_class, buffer);
+      jobject errors = jni->NewObject(arraylist, jni->GetMethodID(arraylist, "<init>", "()V"));
+      jobjectArray args = jni->NewObjectArray(2, jni->FindClass("java/lang/Object"), nullptr);
+      jni->SetObjectArrayElement(args, 0, buffers);
+      jni->SetObjectArrayElement(args, 1, errors);
+      jobject result = jni->CallObjectMethod(
+          method, jni->GetMethodID(method_class, "invoke", "(Ljava/lang/Object;[Ljava/lang/Object;)Ljava/lang/Object;"), nullptr, args);
+      if (!clear_exception(jni, "makeInMemoryDexElements") && result)
+        new_elements = (jobjectArray)result;
+    }
+  }
+  if (!new_elements) {
+    jclass imcl_class = jni->FindClass("dalvik/system/InMemoryDexClassLoader");
+    jobject imcl = jni->NewObject(imcl_class,
+                                  jni->GetMethodID(imcl_class, "<init>", "(Ljava/nio/ByteBuffer;Ljava/lang/ClassLoader;)V"), buffer,
+                                  app_loader);
+    if (clear_exception(jni, "InMemoryDexClassLoader") || !imcl) {
+      jni->PopLocalFrame(nullptr);
+      return;
+    }
+    jobject new_list = reflect_field(jni, base_loader, imcl, "pathList");
+    new_elements = new_list ? (jobjectArray)reflect_field(jni, path_list_class, new_list, "dexElements") : nullptr;
+  }
   if (!app_elements || !new_elements) {
     LOG("dexload: cannot reach the dex elements (hidden API?)");
     jni->PopLocalFrame(nullptr);
     return;
   }
   jsize old_count = jni->GetArrayLength(app_elements), added = jni->GetArrayLength(new_elements);
+  if (added > 0 && (!g_spare_dexfile || size < g_spare_size)) {
+    jclass element_cls = jni->FindClass("dalvik/system/DexPathList$Element");
+    jobject first = jni->GetObjectArrayElement(new_elements, 0);
+    jobject dex_file = first ? reflect_field(jni, element_cls, first, "dexFile") : nullptr;
+    if (dex_file) {
+      if (g_spare_dexfile)
+        jni->DeleteGlobalRef(g_spare_dexfile);
+      g_spare_dexfile = jni->NewGlobalRef(dex_file);
+      g_spare_size = size;
+    }
+  }
   jclass element_class = jni->FindClass("dalvik/system/DexPathList$Element");
   jobjectArray merged = jni->NewObjectArray(old_count + added, element_class, nullptr);
   for (jsize i = 0; i < old_count; i++)
@@ -150,4 +213,11 @@ static void load_dex_into_app_loader(const uint8_t* dex, u32 size) {
 
 void dexload_init() {
   g_dex_handover_hook = on_dex_handover;
+}
+
+// A valid, harmless DexFile (the one of the smallest dex handed over): old packers call DexFile.loadDex on the APK and
+// wrap the result in a DexPathList.Element, which must not be null. Its classes are already in the app class loader.
+jobject dexload_spare_dexfile() {
+  JNIEnv* jni = env();
+  return jni && g_spare_dexfile ? jni->NewLocalRef(g_spare_dexfile) : nullptr;
 }

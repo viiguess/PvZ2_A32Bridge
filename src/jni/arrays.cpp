@@ -22,11 +22,19 @@ static void new_object_array(Ctx& ctx, const Stub&) {
 }
 
 static void get_object_array_element(Ctx& ctx, const Stub&) {
-  ctx.ret(href(env()->GetObjectArrayElement((jobjectArray)hobj(ctx.a(1)), ctx.a(2)), 1));
+  jobject array = hobj(ctx.a(1));
+  if (!array) {  // a Java call that failed earlier left a null array; ART aborts on it
+    ctx.ret(0);
+    return;
+  }
+  ctx.ret(href(env()->GetObjectArrayElement((jobjectArray)array, ctx.a(2)), 1));
 }
 
 static void set_object_array_element(Ctx& ctx, const Stub&) {
-  env()->SetObjectArrayElement((jobjectArray)hobj(ctx.a(1)), ctx.a(2), hobj(ctx.a(3)));
+  jobject array = hobj(ctx.a(1));
+  if (!array)
+    return;
+  env()->SetObjectArrayElement((jobjectArray)array, ctx.a(2), hobj(ctx.a(3)));
 }
 
 // primitive arrays: type index 0..7 = Boolean,Byte,Char,Short,Int,Long,Float,Double
@@ -193,8 +201,22 @@ static void release_array_elements(Ctx& ctx, const Stub& stub) {
         jni->SetIntArrayRegion((jintArray)array, 0, length, (jint*)H(guest_buffer));
         break;
       case 5:
-        jni->SetLongArrayRegion((jlongArray)array, 0, length, (jlong*)H(guest_buffer));
+      {
+        // Old Jiagu packers store the address of the fake art::DexFile (a 32-bit guest address) into the mCookie of a
+        // java DexFile; ART would follow it as a native pointer and crash in FindClass. Real cookies are 64-bit host
+        // pointers, so a write of small non-zero values is dropped.
+        bool guest_pointer = false;
+        for (jsize i = 0; i < length; i++) {
+          unsigned long long v = (unsigned long long)((jlong*)H(guest_buffer))[i];
+          if (v && v < 0x100000000ull)
+            guest_pointer = true;
+        }
+        if (guest_pointer)
+          LOG("ReleaseLongArrayElements: dropped a write of guest pointers into a long[%d]", (int)length);
+        else
+          jni->SetLongArrayRegion((jlongArray)array, 0, length, (jlong*)H(guest_buffer));
         break;
+      }
       case 6:
         jni->SetFloatArrayRegion((jfloatArray)array, 0, length, (jfloat*)H(guest_buffer));
         break;

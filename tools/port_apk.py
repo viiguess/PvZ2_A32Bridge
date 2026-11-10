@@ -462,7 +462,7 @@ def default_return(ret):
     return '    const/4 v0, 0x0\n    return v0'
 
 
-def stub_foreign_natives(out, keep=('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo', 'com/jg/',
+def stub_foreign_natives(out, keep=('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo', 'com/jg/', 'com/unicom/shield/',
                                     'com/common/busi/CustomView')):
     """Native methods of SDK classes live in 32-bit libraries the bridge cannot load, so calling them throws
     UnsatisfiedLinkError (often on a worker thread, which kills the process). They are turned into methods that return
@@ -545,8 +545,38 @@ def nativize_jiagu(smali_dirs):
     return changed
 
 
+def fill_unicom_helper(smali_dirs):
+    """Unpacked Jiagu 2.1-2.3 dex: com.unicom.shield.Helper.makeInMemoryDexElements is a hollowed native that nobody
+    registers (it installs extra dex on old Android, which the bridge's dexload already does): give it a body that
+    returns an empty array."""
+    changed = 0
+    pattern = re.compile(r'^\.method public static native makeInMemoryDexElements\(Ljava/lang/Object;Ljava/util/List;'
+                         r'Ljava/lang/String;\)\[Ljava/lang/Object;\n(?:.*\n)*?\.end method', re.M)
+    body = ('.method public static makeInMemoryDexElements(Ljava/lang/Object;Ljava/util/List;Ljava/lang/String;)'
+            '[Ljava/lang/Object;\n    .locals 1\n    const/4 v0, 0x0\n    new-array v0, v0, [Ljava/lang/Object;\n'
+            '    return-object v0\n.end method')
+    for root_dir in smali_dirs:
+        path = os.path.join(root_dir, 'com', 'unicom', 'shield', 'Helper.smali')
+        if os.path.isfile(path):
+            text = open(path, encoding='utf-8', newline='').read()
+            new, n = pattern.subn(lambda m: body, text.replace('\r\n', '\n'))
+            if n:
+                open(path, 'w', encoding='utf-8', newline='').write(new)
+                changed += n
+    return changed
+
+
+def find_game_activity(smali_dirs):
+    for root_dir in smali_dirs:
+        for directory, _, files in os.walk(root_dir):
+            if 'SexyAppActivity.smali' in files:
+                return 'L' + os.path.relpath(os.path.join(directory, 'SexyAppActivity'), root_dir).replace(os.sep, '/') + ';'
+    return None
+
+
 def unhollow_jiagu(smali_dirs):
     replaced = 0
+    game = find_game_activity(smali_dirs)
     for root_dir in smali_dirs:
         for directory, _, files in os.walk(root_dir):
             for name in files:
@@ -559,13 +589,22 @@ def unhollow_jiagu(smali_dirs):
                 parent = re.search(r'^\.super (L[^;]+;)', text, re.M).group(1)
                 cls = re.search(r'^\.class [^\n]*?(L[^;\s]+;)', text, re.M).group(1)
                 lines = ['invoke-super {p0, p1}, %s->onCreate(Landroid/os/Bundle;)V' % parent]
+                locals_count = 0
                 if cls.endswith('/PermisionActivity;') and 'jumpToLaunchActivity()V' in text:
                     lines += ['invoke-direct {p0}, %s->jumpToLaunchActivity()V' % cls, 'invoke-virtual {p0}, %s->finish()V' % cls]
+                elif cls.endswith('/plugin/Stub01;') and game:
+                    # Jiagu 2.2.x's launcher is the packer's own activity, whose real onCreate starts the game activity
+                    lines = ['invoke-super {p0, p1}, %s->onCreate(Landroid/os/Bundle;)V' % parent,
+                             'new-instance v0, Landroid/content/Intent;', 'const-class v1, %s' % game,
+                             'invoke-direct {v0, p0, v1}, Landroid/content/Intent;-><init>(Landroid/content/Context;Ljava/lang/Class;)V',
+                             'invoke-virtual {p0, v0}, %s->startActivity(Landroid/content/Intent;)V' % cls,
+                             'invoke-virtual {p0}, %s->finish()V' % cls]
+                    locals_count = 2
                 elif not cls.endswith('/SexyAppActivity;'):
                     lines += ['invoke-virtual {p0}, %s->finish()V' % cls]
                 body = '\n'.join('    ' + line for line in lines)
                 text, count = HOLLOW_ONCREATE.subn(
-                    lambda m: '.method %sonCreate(Landroid/os/Bundle;)V\n    .locals 0\n%s\n    return-void\n.end method' % (m.group(1), body),
+                    lambda m: '.method %sonCreate(Landroid/os/Bundle;)V\n    .locals %d\n%s\n    return-void\n.end method' % (m.group(1), locals_count, body),
                     text)
                 if count:
                     if cls.endswith('/SexyAppActivity;'):  # its hollowed onCreate also initialised the Tune SDK that onResume expects
@@ -585,6 +624,20 @@ def install_jiagu(out, bridges):
         os.makedirs(target, exist_ok=True)
         shutil.copy(os.path.join(out, 'assets', 'libjiagu.so'), os.path.join(target, 'libjiagu_a32.so'))
         shutil.copy(bridge, os.path.join(out, 'assets', JIAGU_ASSETS[abi]))
+
+
+def install_art_marker(out, abis):
+    """Jiagu packers of version code <= 865 (Lenovo 2.2.2 and earlier) need a fake libart.so and kOatVersion: the bridge
+    (src/jni/jiagu_compat.cpp) builds them when lib/<abi>/liba32jg.so exists (first line "art", then the symbol names)."""
+    match = re.search(r"versionCode:\s*'?(\d+)", read(os.path.join(out, 'apktool.yml')))
+    if not match or int(match.group(1)) > 865:
+        return False
+    names = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'jiagu_run', 'art_symbols.txt')
+    symbols = [line.strip() for line in open(names, encoding='utf-8') if line.strip()]
+    for abi in abis:
+        os.makedirs(os.path.join(out, 'lib', abi), exist_ok=True)
+        write(os.path.join(out, 'lib', abi, 'liba32jg.so'), '\n'.join(['art'] + symbols) + '\n')
+    return True
 
 
 # ---- Talkweb / China Unicom SDKs -------------------------------------------------------------------------------------
@@ -820,8 +873,11 @@ def main():
         if args.unhollow:
             print('unhollowed %d onCreate native(s) in the unpacked dex' % unhollow_jiagu(added))
             print('declared %d packer support method(s) native' % nativize_jiagu(added))
+            print('filled %d Unicom Helper method(s)' % fill_unicom_helper(added))
     if args.jiagu_bridge:
         install_jiagu(args.out, by_abi(args.jiagu_bridge))
+        if install_art_marker(args.out, sorted(by_abi(args.jiagu_bridge))):
+            print('old Jiagu packer: fake libart marker installed')
         install_original_certificate(args.decoded, args.out)
     removed = remove_muzhiwan(args.out)
     if removed:
