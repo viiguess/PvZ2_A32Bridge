@@ -8,7 +8,7 @@ project(a32bridge LANGUAGES C CXX)
 #   cmake -B build -G Ninja -DCMAKE_TOOLCHAIN_FILE=$NDK/build/cmake/android.toolchain.cmake \
 #         -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DLIBNAME=Game
 
-set(LIBNAME Game CACHE STRING "Name of the game library to stand in for (produces lib<LIBNAME>.so)")
+set(LIBNAME PVZ2 CACHE STRING "Name of the game library to stand in for (produces lib<LIBNAME>.so)")
 set(ORIG_SIG_HASH "500290098" CACHE STRING
     "Signature.hashCode() of the original APK signer, returned when the game checks its own signature (default: PopCap/EA). Empty disables.")
 option(A32_LOG "Log translator messages and the game's own log/stdio output to logcat" OFF)
