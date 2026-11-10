@@ -1,7 +1,6 @@
-# a32bridge
+# PvZ2 A32 Bridge
 
-Run a 32-bit ARM (armeabi / armeabi-v7a) Android game library inside a **64-bit-only** app, so old native games
-install and run on arm64-only devices, current Android versions and x86_64 emulators (MuMu, LDPlayer, WSA).
+Run a 32-bit ARM (armeabi / armeabi-v7a) Android game library inside a **64-bit-only** app, so old versions of the game install and run on arm64-only devices, current Android versions and x86_64 emulators (MuMu, LDPlayer, WSA).
 
 The game's native library is not recompiled. A small arm64 or x86_64 library takes its place, loads the original ARM
 library into a private 4 GiB address space and executes it with the [Dynarmic](https://github.com/merryhime/dynarmic)
@@ -10,8 +9,8 @@ Everything the game imports (libc, libm, zlib, OpenGL ES, OpenSL ES, JNI) is re-
 
 ```
    Java (ART, arm64)
-        |  System.loadLibrary("Game")            lib/arm64-v8a/libGame.so        <- a32bridge
-        v                                          lib/arm64-v8a/libGame_a32.so   <- the original ARM library
+        |  System.loadLibrary("PVZ2")            lib/arm64-v8a/libPVZ2.so        <- a32bridge
+        v                                          lib/arm64-v8a/libPVZ2_a32.so   <- the original ARM library
         |                                          (the same pair under lib/x86_64 for x86 emulators)
  +--------------------+     svc stubs      +----------------------------+
  | guest ARM code     | -----------------> | host HLE: libc, GLES, SLES, |
@@ -47,7 +46,7 @@ Limitations:
 | `src/jni/` | 32-bit `JNIEnv`/`JavaVM` facade: `handles` (object/method/field handles), `calls` (`Call*Method`, fields), `objects`, `strings`, `arrays`, `natives` (`RegisterNatives` trampolines), `vm`, and `bridge` (table construction and `JNI_OnLoad`) |
 | `src/opensles.*` | OpenSL ES interfaces as guest vtables over the host objects |
 | `src/jni/game_exports.cpp` | JNI exports the VM resolves by name rather than via `RegisterNatives` (game specific) |
-| `src/runtime/softfloat_accel.*` | armeabi games do all float math through libgcc helpers (`__aeabi_fadd`, ...) that emulate it with integer code. They are replaced by VFP versions (`tools/softfloat_vfp.S`, built into `softfloat_vfp.h` by `tools/gen_softfloat_vfp.py`) that the JIT turns into single host FP instructions: about 2.5x the frame rate on busy screens |
+| `src/runtime/softfloat_accel.*` | armeabi versions do all float math through libgcc helpers (`__aeabi_fadd`, ...) that emulate it with integer code. They are replaced by VFP versions (`tools/softfloat_vfp.S`, built into `softfloat_vfp.h` by `tools/gen_softfloat_vfp.py`) that the JIT turns into single host FP instructions: about 2.5x the frame rate on busy screens |
 | `src/runtime/mods.*` | Hook libraries the game loads next to its main library (`libczProject.so` and co.) run in the guest too (`--mod` in `port_apk.py`) |
 | `src/libc/compat_imports.cpp` | Imports only old games take from the system (libgcc division helpers, old libstdc++ `new`/`delete`) |
 
@@ -56,7 +55,7 @@ a plain load/store and host code can read guest buffers directly.
 
 Behaviours that exist because the games assume an old Dalvik VM, and that are deliberate:
 
-* Java exceptions are logged and cleared after each call (the games never check them).
+* Java exceptions are logged and cleared after each call (the game never check them).
 * JNI calls with a null class/object/method id are skipped instead of reaching ART, which aborts the process.
 * Local references are recycled slowly so stale handles held by the game do not alias new objects.
 * `Signature.hashCode()` can be answered with a fixed value (`-DORIG_SIG_HASH=...`) for games that check their own
@@ -67,11 +66,11 @@ Behaviours that exist because the games assume an old Dalvik VM, and that are de
 Requirements: Android NDK (r26+), CMake 3.22+, Ninja, git.
 
 ```sh
-git clone <this repository> && cd a32bridge
+git clone <this repository> && cd PvZ2_A32Bridge
 git submodule update --init third_party/dynarmic
 tools/init_boost.sh                                    # only the ~20 Boost libraries Dynarmic needs
-cmake -B build -G Ninja \n  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \n  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \n  -DLIBNAME=Game
-cmake --build build          # -> build/libGame.so
+cmake -B build -G Ninja \n  -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake \n  -DANDROID_ABI=arm64-v8a -DANDROID_PLATFORM=android-24 -DCMAKE_BUILD_TYPE=Release \n  -DLIBNAME=PVZ2
+cmake --build build          # -> build/libPVZ2.so
 ```
 
 For x86 emulators, build it a second time with `-DANDROID_ABI=x86_64` (e.g. into `build_x86_64`). The emulator then
@@ -91,7 +90,7 @@ Options:
 
 | Option | Meaning |
 | --- | --- |
-| `LIBNAME` | Name of the game library to stand in for (`libGame.so`). Must match `System.loadLibrary("Game")` |
+| `LIBNAME` | Name of the game library to stand in for (`libPVZ2.so`). Must match `System.loadLibrary("PVZ2")` |
 | `ORIG_SIG_HASH` | Value returned for `Signature.hashCode()` (see above). Default `500290098` (PopCap/EA); empty disables |
 | `A32_FREE_SHOP` | Runtime patch for the Lenovo PvZ2C 32-bit builds 1.0.1 - 4.2.4 (ARM and Thumb-2, every optimisation level): `PurchaseBroker::onPurchaseConfirm` reports the order as paid instead of calling the payment SDK, and the dialogs that wait for the SDK are skipped (`src/runtime/free_shop.h`). Sites are found by instruction shape and string references, and nothing is patched unless every site is found; the log (`A32_LOG`) says why a build was skipped. Off by default |
 | `A32_LOG` | Log translator messages and the game's own log/stdio output to logcat (tag `a32`) |
@@ -113,7 +112,7 @@ Options:
    original 32-bit libraries** so the same APK also runs natively on 32-bit ARM devices (`--arm64-only` drops them),
    redirects the other libraries' `System.loadLibrary` calls, and adjusts SDK levels and the manifest. Signature
    checks are answered by the bridge itself (`ORIG_SIG_HASH`, which defaults to the PopCap/EA certificate hash
-   `500290098` shared by every PvZ2 build), so the game library stays unmodified. The script reads the real hash from the
+   `500290098` shared by every PvZ2 Chinese Version build), so the game library stays unmodified. The script reads the real hash from the
    APK's original signature and warns if it differs; then rebuild the bridge with `-DORIG_SIG_HASH=<value>`. Read its
    output: it lists implicit service intents that Android 5+ rejects; pin the ones that belong to the app with
    `--pin-intents`.
