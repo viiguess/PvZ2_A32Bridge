@@ -43,7 +43,18 @@ bool handle_references(const std::string& n, Ctx& ctx, Result& r) {
   } else if (n == "FindClass") {
     std::string name = cstr(ctx.a(1));
     fprintf(stderr, "[jni] FindClass %s\n", name.c_str());
-    r.value = class_handle(name);
+    if (hidden_class(name)) {
+      g_java_exception = true;
+      r.value = 0;
+    } else {
+      r.value = class_handle(name);
+    }
+  } else if (n == "ExceptionCheck") {
+    r.value = g_java_exception;
+  } else if (n == "ExceptionOccurred") {
+    r.value = g_java_exception ? new_instance("java/lang/ClassNotFoundException") : 0;
+  } else if (n == "ExceptionClear") {
+    g_java_exception = false;
   } else if (n == "GetObjectClass") {
     Obj* o = obj_of(ctx.a(1));
     r.value = class_handle(o ? o->cls : "java/lang/Object");
@@ -57,8 +68,8 @@ bool handle_references(const std::string& n, Ctx& ctx, Result& r) {
     r.value = 1;
   } else if (n == "ThrowNew") {
     fprintf(stderr, "[jni] ThrowNew %s: %s\n", describe('L', ctx.a(1)).c_str(), cstr(ctx.a(2)).c_str());
-  } else if (n == "DeleteLocalRef" || n == "DeleteGlobalRef" || n == "DeleteWeakGlobalRef" || n == "ExceptionClear" ||
-             n == "ExceptionDescribe" || n == "ExceptionCheck" || n == "ExceptionOccurred" || n == "Throw" ||
+  } else if (n == "DeleteLocalRef" || n == "DeleteGlobalRef" || n == "DeleteWeakGlobalRef" || 
+             n == "ExceptionDescribe" || n == "Throw" ||
              n == "MonitorEnter" || n == "MonitorExit" || n == "PushLocalFrame" || n == "EnsureLocalCapacity") {
     // nothing to do: there are no local frames and no pending exceptions
   } else {
@@ -149,10 +160,18 @@ bool handle_calls(const std::string& n, Ctx& ctx, Result& r) {
   ArgReader::Mode mode = ends(n, "A") ? ArgReader::JVALUES : ends(n, "V") ? ArgReader::VA_LIST : ArgReader::VARIADIC;
   ArgReader reader(ctx, mode, method_slot + 1);
   std::string args;
-  for (size_t i = 0; i < kinds.size(); i++)
-    args += (i ? ", " : "") + describe(kinds[i], reader.read(kinds[i]));
+  std::vector<uint64_t> values;
+  for (size_t i = 0; i < kinds.size(); i++) {
+    values.push_back(reader.read(kinds[i]));
+    args += (i ? ", " : "") + describe(kinds[i], values.back());
+  }
 
-  r.value = is_new ? new_instance(m->cls) : java_call(*m, ctx.a(1));
+  if (is_new) {
+    r.value = new_instance(m->cls);
+    java_constructed(*m, r.value, values);
+  } else {
+    r.value = java_call(*m, ctx.a(1), values);
+  }
   r.wide = !is_new && (ret == 'J' || ret == 'D');
   fprintf(stderr, "[jni] %s %s.%s%s (%s) -> %s\n", n.c_str(), m->cls.c_str(), m->name.c_str(), m->sig.c_str(),
           args.c_str(), describe(is_new || ret == 'L' ? 'L' : 'I', r.value).c_str());

@@ -33,11 +33,17 @@ struct Obj {
   u32 buf = 0;             // primitive arrays: guest buffer
   u32 len = 0;
   int elem_size = 0;
+  std::string data;  // InputStream: the bytes it serves (a JarFile entry of the APK)
+  size_t pos = 0;    // InputStream: read position
+  u32 wrapped = 0;   // BufferedInputStream & co: the stream it wraps
 };
 
 u32 new_obj(const Obj& obj);
 Obj* obj_of(u32 handle);  // nullptr for null / invalid handles
 u32 class_handle(const std::string& name);
+// A class a stock device does not have (Xposed, Substrate...): lookups throw ClassNotFoundException.
+bool hidden_class(const std::string& name);
+extern bool g_java_exception;  // a (fake) exception is pending
 u32 new_string(const std::string& text);
 u32 new_instance(const std::string& cls);
 std::string describe(char kind, uint64_t value);  // for logging: a JNI value as text
@@ -62,5 +68,11 @@ const FieldId* field_id(u32 id);
 std::vector<char> signature_args(const std::string& sig, char& ret);
 
 // ---- behaviour --------------------------------------------------------------------------------------------------
-uint64_t java_call(const MethodId& method, u32 self);     // result of invoking `method` on `self`
+// result of invoking `method` on `self`; `args` are the raw argument values (handles for objects)
+uint64_t java_call(const MethodId& method, u32 self, const std::vector<uint64_t>& args);
+// called after `new cls(args)`: streams remember what they wrap, a JarFile remembers its path
+void java_constructed(const MethodId& ctor, u32 object, const std::vector<uint64_t>& args);
 uint64_t java_get_field(const FieldId& field, u32 self);  // value of a field (statics ignore `self`)
+
+void java_prefetch();
+std::string apk_entry_bytes(const std::string& entry);

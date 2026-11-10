@@ -172,9 +172,39 @@ std::string format_guest(const char* fmt, Args& a) {
   return out;
 }
 
+// The guest's long is 4 bytes, the host's 8: scanf conversions with a single 'l' on an integer (%lx, %lu, %ld...)
+// must store an int, or they overwrite the neighbouring variable.
+std::string scan_format_32bit(const char* fmt) {
+  std::string out;
+  for (const char* c = fmt; *c; c++) {
+    out += *c;
+    if (*c != '%')
+      continue;
+    const char* q = c + 1;
+    if (*q == '%') {
+      out += *q;
+      c = q;
+      continue;
+    }
+    std::string spec;
+    while (*q && strchr("*0123456789", *q))
+      spec += *q++;
+    if (*q == 'l' && q[1] != 'l' && q[1] && strchr("diouxX", q[1]))
+      q++;  // drop the 'l'
+    out += spec;
+    c = q - 1;
+  }
+  return out;
+}
+
 void scan_guest(Ctx& ctx, int src_idx, bool wide, bool file) {
   void* src = file ? (void*)file_host(ctx.a(src_idx)) : ctx.p(src_idx);
   void* fmt = ctx.p(src_idx + 1);
+  std::string narrow_fmt;
+  if (!wide) {
+    narrow_fmt = scan_format_32bit((const char*)fmt);
+    fmt = (void*)narrow_fmt.c_str();
+  }
   void* value[8];
   for (int i = 0; i < 8; i++)
     value[i] = H(ctx.a(src_idx + 2 + i));

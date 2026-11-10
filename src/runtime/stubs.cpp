@@ -59,6 +59,11 @@ u32 stub_find(const std::string& name) {
   return it == g_syms.end() ? 0 : it->second;
 }
 
+std::vector<std::pair<std::string, u32>> sym_all() {
+  std::lock_guard<std::mutex> lock(g_sym_mu);
+  return std::vector<std::pair<std::string, u32>>(g_syms.begin(), g_syms.end());
+}
+
 // Pre-ARMv6 binaries call the Linux kuser helpers (atomics/TLS) at fixed addresses in the top page.
 void kuser_init() {
   static const u32 barrier[] = {0xF57FF05B, 0xE12FFF1E};  // dmb ish; bx lr

@@ -19,13 +19,13 @@ Everything the game imports (libc, libm, zlib, OpenGL ES, OpenSL ES, JNI) is re-
  +--------------------+     guest_call     +----------------------------+
 ```
 
-## Status
+## Scope
 
-Built for and tested with several Plants vs. Zombies 2 builds (1.4 and 5.1) and Chinese Version (1.1.0, 1.3.4 and 1.6.3); ARMv5 to ARMv7, GLES 1.1 and 2.0, OpenSL ES
-audio, Java SDK integrations. It is not a general Android emulator: it implements exactly the imports those games
-use, and a different game will likely need a few more stubs. Missing imports are logged (see *Debugging*) and return 0.
+It is not a general Android emulator: it implements the imports the supported games use (ARMv5 to ARMv7, GLES 1.1 and 2.0,
+OpenSL ES, Java SDK integrations), and a different game will likely need a few more stubs. Missing imports are logged (see
+*Debugging*) and return 0.
 
-Limitations worth knowing:
+Limitations:
 
 * Only the game's main native library runs. Other 32-bit libraries shipped in the APK (ad/analytics/payment SDKs,
   packers) cannot be loaded into a 64-bit process; their `System.loadLibrary` calls are redirected and their native
@@ -134,14 +134,29 @@ runs the packer's library the same way it runs the game's:
 1. Build a second bridge with `-DLIBNAME=jiagu`. The stub copies `assets/libjiagu_a64.so` out of the APK on 64-bit
    devices and loads it, so this bridge takes that place. The packer's own library becomes the guest,
    `lib/arm64-v8a/libjiagu_a32.so`, and the bridge finds it through the app's native library directory. An x86_64
-   jiagu bridge goes to `assets/libjiagu_x64.so` (untested).
-2. Run `tools/jiagu_run` on the original library to get the decrypted dex (`classes_unpacked.dex`). The bridge cannot
-   hand a dex to ART the way the packer does on an old Android, so the classes are added to the app as an extra dex.
-3. Port with `port_apk.py ... --jiagu-bridge libjiagu.so --jiagu-dex classes_unpacked.dex --baksmali baksmali.jar`.
+   jiagu bridge goes to `assets/libjiagu_x64.so`.
+2. Run `tools/jiagu_run` on the original library (`assets/libjiagu.so` in the APK, under that exact file name) to get the
+   decrypted dex files (`classes_unpacked.dex`, and `classes_unpacked2.dex`, ... when the packer hands over more than
+   one). The bridge cannot hand a dex to ART the way the packer does on an old Android, so the classes are added to the
+   app as extra dex files.
+3. Port with `port_apk.py ... --jiagu-bridge libjiagu.so --jiagu-dex classes_unpacked.dex --jiagu-dex classes_unpacked2.dex
+   --baksmali baksmali.jar` (one `--jiagu-dex` per file).
    The game's bridge (`-DLIBNAME=<game library>`) is the positional argument as usual.
 4. Rebuild with apktool, then `port_apk.py finish original.apk rebuilt.apk output.apk`, then zipalign and sign. This
    step matters: apktool rebuilds `classes.dex` from smali and drops the packer's payload and the ZIP comment it
    reads, and the packer refuses to start without them. The packer's stub is never edited.
+
+Jiagu 2.4.x (Lenovo PvZ2C 2.4.x and later) additionally needs:
+
+* `--unhollow` when porting: the game's activities have their `onCreate` hollowed into natives whose real code lives in
+  the packer's payload and cannot run here, so they get minimal bodies; the packer's support classes (`com.jg.*`, ...) are
+  declared `native` so that its `RegisterNatives` accepts them.
+* `port_apk.py finish ... --dex-in-lib`: this packer walks the APK's central directory and refuses to start when it finds
+  a `classes2.dex`, so the extra dex files are shipped as `lib/<abi>/liba32dex<N>.so`. The bridge loads them with an
+  `InMemoryDexClassLoader` and appends them to the app class loader (`src/jni/dexload.cpp`, API 26+).
+* The original signing certificate, shipped as `lib/<abi>/liba32sig.so` (done by `--jiagu-bridge`): the APK is re-signed
+  and the packer compares the certificate bytes, so the bridge answers `Signature.toByteArray` / `toCharsString` /
+  `JarEntry.getCertificates` with it.
 
 What the bridge provides for the packer (`src/libc/system_imports.cpp`, `syscalls.cpp`): a synthetic
 `/proc/self/maps` (also `/proc/<pid>/maps`, also through a raw `open`), raw `svc #0` system calls, and the

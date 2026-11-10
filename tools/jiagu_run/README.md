@@ -21,6 +21,9 @@ tools/jiagu_run/jr.sh run --trace ...                    # also log every guest 
 
 From Windows: `wsl -e bash /mnt/c/.../tools/jiagu_run/jr.sh run ...`.
 
+The library file **must be named `libjiagu.so`**: the packer looks for that name in its own path and kills itself otherwise.
+The runner needs `python3` on the host, plus `openssl` (the APK's signing certificate, `apk_cert.py`).
+
 The workdir stands in for the app's data directory. Packers hard-code `/data/data/<package>`, so create it first
 (`sudo mkdir -p /data/data/<package>/files && sudo chmod -R 777 /data`) and pass it as the workdir.
 
@@ -48,6 +51,8 @@ always one case in `fake_java.cpp` (what a Java method or field returns), `fake_
 | `fake_java.*` | The fake Java world: object handles, classes, method and field ids, and the canned answers for Android APIs (package info, `Build.*`, the APK path, ...) |
 | `fake_jni.*` | The guest `JNIEnv` / `JavaVM` tables; every JNI function logs and dispatches to `fake_java` |
 | `host_env.*` | Libc imports the game library never needed (`mmap`, `strdup`, `uname`, rwlocks, ...), the system-property table, and the synthetic `/proc/self/maps` |
+| `apk_cert.py` | Prints the APK's v1 signing certificate (DER hex, or `--subject`); the fake `PackageManager` answers `GET_SIGNATURES` with it, because newer packers compare its hash |
+| `fake_libart.py`, `art_symbols.txt` | Build a tiny ELF `libart.so` / `linker` exporting the given symbols. Old packers parse `/system/lib/libart.so` and inline-hook ART; `art_symbols.txt` is the union of the ART symbols all old builds ask for |
 | `syscalls.cpp` | Emulation of Linux ARM system calls issued with a raw `svc #0` |
 | `jni_names.inc` | Names of the `JNIEnv` function table slots, in order (generated from `jni.h`) |
 | `shim/android/log.h` | Minimal `<android/log.h>`, so the shared runtime builds on a Linux host |
@@ -59,10 +64,19 @@ function. Two optional hooks let an embedding program extend the runtime: `g_pat
 
 ## Getting the decrypted dex
 
-A packer hands its decrypted dex to ART through `art::DexFile::OpenMemory`. The runner answers those lookups with a
-function that saves the dex to `<workdir>/classes_unpacked.dex` and returns a fake `DexFile` (virtual methods that return
-0, fields pointing at the dex), so the packer carries on. The result can be added to the ported APK as an extra dex
-(`port_apk.py --jiagu-dex`).
+A packer hands its decrypted dex to ART through `art::DexFile::OpenMemory` (Jiagu 2.1.x and 2.2.0 use `OpenCommon`; the
+Android 6+ variants return a `unique_ptr` through a hidden pointer, which the stubs handle). The runner answers those
+lookups with a function that saves each dex to `<workdir>/classes_unpacked.dex`, `classes_unpacked2.dex`, ... and returns a
+fake `DexFile` (virtual methods that return 0, fields pointing at the dex), so the packer carries on. Newer packers hand
+over two or three dex files; pass them all to the ported APK (`port_apk.py --jiagu-dex` is repeatable). The very old
+packers decrypt into fresh mappings without calling ART; the runner then scans guest memory for valid dex images.
+
+Other things the runner fakes for the packers: an Android environment (`getenv`,
+`Build.*`, system properties, a Pixel-like device), `/proc/self/maps` with libc, libart, the linker and friends, `execve` of
+`/system/bin/dex2oat` (creates the oat file, exits 0), `fork`/`waitpid` for the helper process of old packers, and the
+`.jiagu` files they write. The old packers (version code <= 865) also get `JR_OAT=1` and a libart with the ART symbol list;
+the environment variables `JR_OAT`, `JR_LIBART_SYMS` (`none` disables) and `JR_LINKER_SYMS` override those defaults, and
+`JR_SDK=<n>` pretends to be another Android version.
 
 `JR_CALL=name[,name...]` calls natives the library registered (`RegisterNatives`) once `JNI_OnLoad` has run, with
 placeholder arguments (`JR_INT` is the value of integer arguments), and the `[jni]` lines show what they do. This is how
@@ -75,10 +89,3 @@ There is no need for a Linux host: the runner is an ordinary arm64 program. Buil
 (`cmake -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK/build/cmake/android.toolchain.cmake -DANDROID_ABI=arm64-v8a ...`; bionic has no
 `libpthread`, so pass `-DCMAKE_EXE_LINKER_FLAGS=-L<dir with an empty libpthread.a>`), push it with the library and the APK to
 `/data/local/tmp`, and run it with `adb shell`.
-
-## Status
-
-Tested with the 360 Jiagu stub of Plants vs. Zombies 2 Chinese 2.2.7. `libjiagu.so` loads, runs its anti-debug and
-device-information checks, unpacks and loads its embedded second stage, decrypts the dex, and `JNI_OnLoad` returns success
-with 14 natives registered (the `com.stub.StubApp` ones among them). The natives of the protected classes are registered
-by `StubApp.interface11(n)` when the class is initialised.

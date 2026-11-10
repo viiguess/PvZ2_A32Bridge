@@ -4,6 +4,9 @@
 // guest executes the svc, the JIT calls back into the host with the call's register state wrapped in a `Ctx`.
 #pragma once
 
+#include <vector>
+#include <string>
+#include <utility>
 #include <string>
 
 #include "common.h"
@@ -55,6 +58,7 @@ struct Stub {
 u32 stub_add(const char* name, Handler handler, void* fn = nullptr, const char* sig = nullptr);
 const Stub* stub_by_index(u32 index);    // nullptr if out of range
 u32 stub_find(const std::string& name);  // guest address of a symbol, 0 if unknown
+std::vector<std::pair<std::string, u32>> sym_all();  // every exported symbol (for fake soinfo symbol tables)
 
 void sym_add(const char* name, u32 guest_addr);              // export a data symbol
 u32 sym_add_asm(const char* name, const u32* words, int n);  // export hand-assembled guest code

@@ -130,7 +130,8 @@ void register_memory_imports() {
   gen("memchr", "piu>P");
   stub_add("__aeabi_memcpy", generic, dlsym(RTLD_DEFAULT, "memcpy"), "ppu>v");
   stub_add("__aeabi_memmove", generic, dlsym(RTLD_DEFAULT, "memmove"), "ppu>v");
-  hle("__aeabi_memset", import_aeabi_memset);
+  for (const char* name : {"__aeabi_memset", "__aeabi_memset4", "__aeabi_memset8"})
+    hle(name, import_aeabi_memset);
   for (const char* name : {"__aeabi_memclr", "__aeabi_memclr4", "__aeabi_memclr8"})
     hle(name, import_aeabi_memclr);
   for (const char* name : {"__aeabi_memcpy4", "__aeabi_memcpy8"})
@@ -150,6 +151,7 @@ void register_memory_imports() {
   gen("strncat", "ppu>P");
   gen("strchr", "pi>P");
   gen("strstr", "pp>P");
+  gen("strcasestr", "pp>P");
   gen("strcspn", "pp>u");
   gen("atoll", "p>q");
   gen("strpbrk", "pp>P");

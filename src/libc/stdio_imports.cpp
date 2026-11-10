@@ -167,6 +167,13 @@ static void import_access(Ctx& ctx, const Stub&) {
 
 static void import_open(Ctx& ctx, const Stub&) {
   int result = open(guest_host_path((const char*)ctx.p(0)), open_flags_from_guest(ctx.a(1)), ctx.a(2));
+  if (result < 0 && errno == ENOENT) {
+    // Old Jiagu packers expect the oat file their dexopt child creates next to the unpacked dex.
+    const char* guest_path = (const char*)ctx.p(0);
+    size_t length = strlen(guest_path);
+    if (length > 17 && !strcmp(guest_path + length - 17, "/.jiagu/classes.oat"))
+      result = open(guest_host_path(guest_path), open_flags_from_guest(ctx.a(1)) | O_CREAT, 0600);
+  }
   set_errno();
   ctx.ret(result);
 }
@@ -486,6 +493,7 @@ static void import_gethostbyname(Ctx& ctx, const Stub&) {
   hints.ai_socktype = SOCK_STREAM;
   addrinfo* result = nullptr;
   if (getaddrinfo((const char*)ctx.p(0), nullptr, &hints, &result) != 0 || !result) {
+    LOG("gethostbyname(%s) failed", (const char*)ctx.p(0));
     ctx.ret(0);  // h_errno is not modelled
     return;
   }
@@ -618,8 +626,19 @@ void register_stdio_imports() {
   gen("bind", "ipu>i");
   gen("listen", "ii>i");
   gen("accept", "ipp>i");
-  gen("send", "ipui>i");
-  gen("recv", "ipui>i");
+  // send/recv: A32_NETLOG=1 prints the first bytes of each transfer (packers talk to their own servers)
+  hle("send", [](Ctx& ctx, const Stub&) {
+    ssize_t n = send((int)ctx.a(0), ctx.p(1), ctx.a(2), (int)ctx.a(3));
+    if (getenv("A32_NETLOG"))
+      LOG("send(%d, %u bytes) = %zd: %.*s", (int)ctx.a(0), ctx.a(2), n, (int)std::min<u32>(ctx.a(2), 400), (const char*)ctx.p(1));
+    ctx.ret((u32)n);
+  });
+  hle("recv", [](Ctx& ctx, const Stub&) {
+    ssize_t n = recv((int)ctx.a(0), ctx.p(1), ctx.a(2), (int)ctx.a(3));
+    if (getenv("A32_NETLOG"))
+      LOG("recv(%d) = %zd: %.*s", (int)ctx.a(0), n, (int)std::max<ssize_t>(0, std::min<ssize_t>(n, 400)), (const char*)ctx.p(1));
+    ctx.ret((u32)n);
+  });
   gen("sendto", "ipuipu>i");
   gen("recvfrom", "ipuipp>i");
   gen("shutdown", "ii>i");

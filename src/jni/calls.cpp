@@ -1,9 +1,11 @@
 // Call<Type>Method, NewObject and Get/Set<Type>Field: decode the guest's arguments and invoke the host JNI.
+#include <stdio.h>
 #include <string.h>
 
 #include <string>
 #include <vector>
 
+#include "jni/bridge.h"
 #include "jni/handles.h"
 
 thread_local std::string t_last_call;
@@ -194,6 +196,50 @@ static void do_call(Ctx& ctx, int kind, int source, int return_type, bool is_new
     }
   }
 #endif
+  // The APK is re-signed: answer certificate queries about it with the original certificate (see original_certificate).
+  if (kind == CALL_VIRTUAL && !original_certificate().empty() &&
+      (method.name == "toByteArray" || method.name == "toCharsString" || method.name == "getCertificates")) {
+    const std::string& der = original_certificate();
+    static jclass signature = (jclass)jni->NewGlobalRef(jni->FindClass("android/content/pm/Signature"));
+    static jclass jar_entry = (jclass)jni->NewGlobalRef(jni->FindClass("java/util/jar/JarEntry"));
+    if (method.name != "getCertificates" && jni->IsInstanceOf(obj, signature)) {
+      if (method.name == "toByteArray") {
+        jbyteArray bytes = jni->NewByteArray((jsize)der.size());
+        jni->SetByteArrayRegion(bytes, 0, (jsize)der.size(), (const jbyte*)der.data());
+        ctx.ret(href(bytes, REF_LOCAL));
+      } else {
+        std::string hex;
+        char two[3];
+        for (char c : der) {
+          snprintf(two, sizeof two, "%02x", (unsigned char)c);
+          hex += two;
+        }
+        ctx.ret(href(jni->NewStringUTF(hex.c_str()), REF_LOCAL));
+      }
+      return;
+    }
+    if (method.name == "getCertificates" && jni->IsInstanceOf(obj, jar_entry)) {  // JarEntry.getCertificates()
+      jclass factory_class = jni->FindClass("java/security/cert/CertificateFactory");
+      jclass stream_class = jni->FindClass("java/io/ByteArrayInputStream");
+      jclass cert_class = jni->FindClass("java/security/cert/Certificate");
+      jbyteArray bytes = jni->NewByteArray((jsize)der.size());
+      jni->SetByteArrayRegion(bytes, 0, (jsize)der.size(), (const jbyte*)der.data());
+      jobject stream = jni->NewObject(stream_class, jni->GetMethodID(stream_class, "<init>", "([B)V"), bytes);
+      jobject factory = jni->CallStaticObjectMethod(
+          factory_class,
+          jni->GetStaticMethodID(factory_class, "getInstance", "(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;"),
+          jni->NewStringUTF("X.509"));
+      jobject cert = jni->CallObjectMethod(
+          factory, jni->GetMethodID(factory_class, "generateCertificate", "(Ljava/io/InputStream;)Ljava/security/cert/Certificate;"),
+          stream);
+      if (!jni->ExceptionCheck() && cert) {
+        jobjectArray certs = jni->NewObjectArray(1, cert_class, cert);
+        ctx.ret(href(certs, REF_LOCAL));
+        return;
+      }
+      jni->ExceptionClear();  // fall through to the real answer
+    }
+  }
   t_last_call = method.name + method.sig;
   ArgReader reader{&ctx, arg_index, 0, source};
   if (source != ARGS_VARIADIC)

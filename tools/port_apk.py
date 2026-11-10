@@ -38,7 +38,7 @@ What it does:
      WifiInfo.getMacAddress are replaced by values derived from the device's ANDROID_ID (tools/install_ids). The id
      survives restarts and reinstalls and only changes on a factory reset or when the APK's signing key changes.
   8. 360 Jiagu packed games (--jiagu-bridge, --jiagu-dex, --baksmali): see "Packed games" in the README. After
-     apktool has rebuilt the APK, `port_apk.py finish original.apk rebuilt.apk output.apk` puts the packed classes.dex
+     apktool has rebuilt the APK, `port_apk.py finish original.apk rebuilt.apk output.apk [--dex-in-lib]` puts the packed classes.dex
      and the ZIP comment back; then zipalign and sign.
   8b. Muzhiwan embed SDK (a wrapper around some Chinese builds, 1.0.x): removed. Its Application, launcher activity
      and signature checks (`PopUtils`) are not needed and cannot run here.
@@ -98,8 +98,8 @@ def der_item(data, pos):
     return tag, pos, pos + length
 
 
-def original_signature_hash(decoded):
-    """Java's Signature.hashCode() for the first signer certificate of the original APK, or None."""
+def original_certificate(decoded):
+    """DER of the first signer certificate of the original APK (what PackageInfo.signatures[0] holds), or None."""
     meta = os.path.join(decoded, 'original', 'META-INF')
     if not os.path.isdir(meta):
         return None
@@ -122,11 +122,35 @@ def original_signature_hash(decoded):
             cert = data[start:end]
         except IndexError:
             continue
-        h = 1
-        for b in cert:  # java.util.Arrays.hashCode(byte[])
-            h = (31 * h + (b - 256 if b > 127 else b)) & 0xffffffff
-        return h - (1 << 32) if h > 0x7fffffff else h
+        return cert
     return None
+
+
+def original_signature_hash(decoded):
+    """Java's Signature.hashCode() for the first signer certificate of the original APK, or None."""
+    cert = original_certificate(decoded)
+    if cert is None:
+        return None
+    h = 1
+    for b in cert:  # java.util.Arrays.hashCode(byte[])
+        h = (31 * h + (b - 256 if b > 127 else b)) & 0xffffffff
+    return h - (1 << 32) if h > 0x7fffffff else h
+
+
+# The bridge answers signature checks with the original certificate (Signature.toByteArray, JarEntry.getCertificates,
+# ...), which packers such as 360 Jiagu 2.3.4+ compare byte for byte. It reads it from this file in the native library
+# directory (the APK is re-signed, so the real one is gone).
+CERT_FILE = 'liba32sig.so'
+
+
+def install_original_certificate(decoded, out):
+    cert = original_certificate(decoded)
+    if cert is None:
+        return
+    for abi in ('arm64-v8a', 'x86_64'):
+        if os.path.isdir(os.path.join(out, 'lib', abi)):
+            with open(os.path.join(out, 'lib', abi, CERT_FILE), 'wb') as f:
+                f.write(cert)
 
 
 ELF_MACHINE_ABIS = {183: 'arm64-v8a', 62: 'x86_64'}  # EM_AARCH64, EM_X86_64
@@ -438,7 +462,7 @@ def default_return(ret):
     return '    const/4 v0, 0x0\n    return v0'
 
 
-def stub_foreign_natives(out, keep=('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo',
+def stub_foreign_natives(out, keep=('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo', 'com/jg/',
                                     'com/common/busi/CustomView')):
     """Native methods of SDK classes live in 32-bit libraries the bridge cannot load, so calling them throws
     UnsatisfiedLinkError (often on a worker thread, which kills the process). They are turned into methods that return
@@ -478,7 +502,77 @@ def add_unpacked_dex(out, dex, baksmali):
     number = 2
     while os.path.exists(os.path.join(out, 'smali_classes%d' % number)):
         number += 1
-    subprocess.run(['java', '-jar', baksmali, 'd', dex, '-o', os.path.join(out, 'smali_classes%d' % number)], check=True)
+    target = os.path.join(out, 'smali_classes%d' % number)
+    subprocess.run(['java', '-jar', baksmali, 'd', dex, '-o', target], check=True)
+    return target
+
+
+# 360 Jiagu turns the onCreate of some activities into natives whose real code lives in the packer's payload (it needs the
+# packer's ART hooks and cannot run here). With --unhollow they are replaced by the shortest bodies that keep the game
+# running: the launcher goes straight to the game activity (Talkweb's PermisionActivity), the game activity calls super,
+# every other one (payment, ad, share and crash screens) calls super and finishes.
+HOLLOW_ONCREATE = re.compile(r'^\.method ([^\n]*?)native onCreate\(Landroid/os/Bundle;\)V\n(?:    [^\n]*\n)*?\.end method', re.M)
+TUNE_CALLS = re.compile(r'    invoke-static \{\}, Lcom/tune/Tune;->getInstance\(\)Lcom/tune/Tune;\n\n    move-result-object v0\n\n'
+                        r'    invoke-virtual \{v0(?:, p0)?\}, Lcom/tune/Tune;->(?:setReferralSources\(Landroid/app/Activity;\)|measureSession\(\))V\n\n?')
+
+
+# The packer's support classes are plain Java stubs in the unpacked dex; on a device the packer turns these methods into
+# natives (its ART hooks) before RegisterNatives binds them. Declare them native so that RegisterNatives accepts them.
+JIAGU_NATIVE_METHODS = {
+    'com/common/busi/CustomView': ['getAppkey()Ljava/lang/String;', 'getPT()J'],
+    'com/jg/bh/BH': ['mark2(Ljava/lang/String;DD)V', 'mark3()Ljava/lang/String;'],
+    'com/jg/ce/Interface2': ['interface%d(Landroid/content/Context;)I' % n for n in range(1, 6)],
+    'com/qihoo/bugreport/javacrash/CrashReportDataFactory': ['interface9()Ljava/lang/String;'],
+    'com/qihoo/jg/DeviceEntry': ['interface1()Ljava/lang/String;', 'interface2()Ljava/lang/String;', 'interface3()Ljava/lang/String;'],
+    'com/stub/stub07/Stub01': ['mark1(Ljava/lang/String;)V'],
+}
+
+
+def nativize_jiagu(smali_dirs):
+    changed = 0
+    for root_dir in smali_dirs:
+        for cls, methods in JIAGU_NATIVE_METHODS.items():
+            path = os.path.join(root_dir, cls + '.smali')
+            if not os.path.isfile(path):
+                continue
+            text = open(path, encoding='utf-8').read()
+            for method in methods:
+                pattern = re.compile(r'^\.method ([^\n]*?)%s\n(?:    [^\n]*\n|\n)*?\.end method' % re.escape(method), re.M)
+                text, count = pattern.subn(lambda m: '.method %snative %s\n.end method' % (m.group(1), method)
+                                           if ' native ' not in ' ' + m.group(1) else m.group(0), text)
+                changed += count
+            open(path, 'w', encoding='utf-8', newline='').write(text)
+    return changed
+
+
+def unhollow_jiagu(smali_dirs):
+    replaced = 0
+    for root_dir in smali_dirs:
+        for directory, _, files in os.walk(root_dir):
+            for name in files:
+                if not name.endswith('.smali'):
+                    continue
+                path = os.path.join(directory, name)
+                text = open(path, encoding='utf-8').read()
+                if 'native onCreate(' not in text:
+                    continue
+                parent = re.search(r'^\.super (L[^;]+;)', text, re.M).group(1)
+                cls = re.search(r'^\.class [^\n]*?(L[^;\s]+;)', text, re.M).group(1)
+                lines = ['invoke-super {p0, p1}, %s->onCreate(Landroid/os/Bundle;)V' % parent]
+                if cls.endswith('/PermisionActivity;') and 'jumpToLaunchActivity()V' in text:
+                    lines += ['invoke-direct {p0}, %s->jumpToLaunchActivity()V' % cls, 'invoke-virtual {p0}, %s->finish()V' % cls]
+                elif not cls.endswith('/SexyAppActivity;'):
+                    lines += ['invoke-virtual {p0}, %s->finish()V' % cls]
+                body = '\n'.join('    ' + line for line in lines)
+                text, count = HOLLOW_ONCREATE.subn(
+                    lambda m: '.method %sonCreate(Landroid/os/Bundle;)V\n    .locals 0\n%s\n    return-void\n.end method' % (m.group(1), body),
+                    text)
+                if count:
+                    if cls.endswith('/SexyAppActivity;'):  # its hollowed onCreate also initialised the Tune SDK that onResume expects
+                        text = TUNE_CALLS.sub('', text)
+                    open(path, 'w', encoding='utf-8', newline='').write(text)
+                    replaced += count
+    return replaced
 
 
 JIAGU_ASSETS = {'arm64-v8a': 'libjiagu_a64.so', 'x86_64': 'libjiagu_x64.so'}  # what the packer's stub loads per ABI
@@ -608,26 +702,50 @@ def fix_styles(out):
     write(path, text)
 
 
-def finish(original, rebuilt, output):
+def finish(original, rebuilt, output, dex_in_lib=False):
     """Puts the original classes.dex and ZIP comment of a packed APK back into the APK that apktool rebuilt.
 
     A packer such as 360 Jiagu hides its payload inside classes.dex and keeps data in the ZIP comment. apktool rebuilds
     classes.dex from smali, which drops the payload, and the comment is lost too, so the packer cannot find what it
-    needs at start-up. Run this before zipalign and signing: the signature covers both."""
+    needs at start-up. Run this before zipalign and signing: the signature covers both.
+
+    With dex_in_lib (`--dex-in-lib`) the extra dex files added with --jiagu-dex are moved out of the APK into
+    lib/<abi>/liba32dex<N>.so, which the bridge loads at run time (jni/dexload.cpp). Jiagu 2.4.x needs this: it walks the
+    APK's central directory and refuses to start when it finds a classes2.dex."""
     with zipfile.ZipFile(original) as source:
         packed_dex = source.read('classes.dex')
         comment = source.comment
+        original_names = set(source.namelist())
     with zipfile.ZipFile(rebuilt) as source, zipfile.ZipFile(output, 'w') as destination:
-        for info in source.infolist():
+        # Keep the original order of the entries and put new ones (extra dex files, bridge libraries) last: newer
+        # packers walk the central directory and expect the entries around classes.dex to be the original ones.
+        with zipfile.ZipFile(original) as reference:
+            position = {info.filename: n for n, info in enumerate(reference.infolist())}
+        entries = sorted(source.infolist(), key=lambda info: position.get(info.filename, len(position)))
+        # Extra dex files (--jiagu-dex) must not stay in the APK as classesN.dex: Jiagu 2.4.x walks the central directory
+        # and gives up on them. They ship as lib/<abi>/liba32dex<N>.so instead; the bridge loads them (jni/dexload.cpp).
+        abis = [abi for abi in ('arm64-v8a', 'x86_64') if 'lib/%s/libjiagu_a32.so' % abi in source.namelist()] if dex_in_lib else []
+        extra_dex = re.compile(r'classes([2-9])\.dex$')
+        moved = 0
+        for info in entries:
+            match = extra_dex.match(info.filename)
+            if match and info.filename not in original_names and abis:
+                for abi in abis:
+                    destination.writestr('lib/%s/liba32dex%s.so' % (abi, match.group(1)), source.read(info),
+                                         compress_type=zipfile.ZIP_STORED)
+                moved += 1
+                continue
             data = packed_dex if info.filename == 'classes.dex' else source.read(info)
             destination.writestr(info, data, compress_type=info.compress_type)
+        if moved:
+            print('moved %d extra dex file(s) into lib/<abi>/liba32dex<N>.so' % moved)
         destination.comment = comment
     print('kept the packed classes.dex (%d bytes) and a %d-byte ZIP comment' % (len(packed_dex), len(comment)))
 
 
 def main():
-    if len(sys.argv) == 5 and sys.argv[1] == 'finish':  # port_apk.py finish original.apk rebuilt.apk output.apk
-        finish(*sys.argv[2:])
+    if len(sys.argv) in (5, 6) and sys.argv[1] == 'finish':  # port_apk.py finish original.apk rebuilt.apk output.apk [--dex-in-lib]
+        finish(*sys.argv[2:5], dex_in_lib=len(sys.argv) == 6 and sys.argv[5] == '--dex-in-lib')
         return
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('decoded', help='apktool-decoded APK directory')
@@ -640,8 +758,12 @@ def main():
                         help='the same bridge built for another ABI (e.g. x86_64), same file name')
     parser.add_argument('--jiagu-bridge', action='append', default=[], metavar='LIB',
                         help='bridge built with -DLIBNAME=jiagu: runs the 360 Jiagu stub (repeatable, one per ABI)')
-    parser.add_argument('--jiagu-dex', metavar='DEX', help='decrypted dex of a 360 Jiagu app, added as an extra dex')
+    parser.add_argument('--jiagu-dex', metavar='DEX', action='append', default=[],
+                        help='decrypted dex of a 360 Jiagu app, added as an extra dex (repeatable: jiagu_run saves '
+                             'classes_unpacked.dex, classes_unpacked2.dex, ... when the packer hands over several)')
     parser.add_argument('--baksmali', metavar='JAR', help='baksmali jar, needed with --jiagu-dex')
+    parser.add_argument('--unhollow', action='store_true',
+                        help='with --jiagu-dex: replace the packer-hollowed Activity.onCreate natives by minimal bodies')
     parser.add_argument('--mod', action='append', default=[], metavar='NAME',
                         help='hook library lib<NAME>.so to run inside the bridge (repeatable; the bridge loads '
                              'czProject, HookPVZ2 and Restart)')
@@ -694,9 +816,13 @@ def main():
     if args.jiagu_dex:
         if not args.baksmali:
             sys.exit('--jiagu-dex needs --baksmali')
-        add_unpacked_dex(args.out, args.jiagu_dex, args.baksmali)
+        added = [add_unpacked_dex(args.out, dex, args.baksmali) for dex in args.jiagu_dex]
+        if args.unhollow:
+            print('unhollowed %d onCreate native(s) in the unpacked dex' % unhollow_jiagu(added))
+            print('declared %d packer support method(s) native' % nativize_jiagu(added))
     if args.jiagu_bridge:
         install_jiagu(args.out, by_abi(args.jiagu_bridge))
+        install_original_certificate(args.decoded, args.out)
     removed = remove_muzhiwan(args.out)
     if removed:
         print('Muzhiwan embed SDK removed: %d PopUtils methods turned into no-ops, game activity is the launcher' % removed)

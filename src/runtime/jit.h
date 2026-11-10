@@ -173,6 +173,8 @@ struct Cpu final : Dynarmic::A32::UserCallbacks {
 
   void ExceptionRaised(u32 pc, Dynarmic::A32::Exception e) override {
     LOG("guest exception %d at pc=%08x (word %08x)", (int)e, pc, mapped(pc) ? *(u32*)(G + pc) : 0);
+    fprintf(stderr, "[a32]   lr %08x sp %08x r0-r3 %08x %08x %08x %08x r4-r7 %08x %08x %08x %08x\n", reg(14), reg(13), reg(0), reg(1), reg(2),
+        reg(3), reg(4), reg(5), reg(6), reg(7));
     fault = true;
     jit->HaltExecution();
   }

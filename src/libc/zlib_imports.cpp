@@ -62,14 +62,17 @@ static void zlib_op(Ctx& ctx, const Stub&) {
   int result;
   if (OP == 0) {  // inflateInit_(strm, version, size)
     stream = z_get(guest_strm, true);
+    z_in(guest_strm, stream);  // fields set before init (legal with real zlib) must survive it
     result = inflateInit(stream);
     z_out(guest_strm, stream);
   } else if (OP == 8) {  // deflateInit_(strm, level, version, size)
     stream = z_get(guest_strm, true);
+    z_in(guest_strm, stream);  // fields set before init (legal with real zlib) must survive it
     result = deflateInit(stream, (int)ctx.a(1));
     z_out(guest_strm, stream);
   } else if (OP == 9) {  // inflateInit2_(strm, windowBits, version, size)
     stream = z_get(guest_strm, true);
+    z_in(guest_strm, stream);  // fields set before init (legal with real zlib) must survive it
     result = inflateInit2(stream, (int)ctx.a(1));
     z_out(guest_strm, stream);
   } else if (OP == 10) {  // deflateBound(strm, sourceLen)
@@ -78,6 +81,7 @@ static void zlib_op(Ctx& ctx, const Stub&) {
     return;
   } else if (OP == 1) {  // deflateInit2_(strm, level, method, wbits, memlevel, strategy, version, size)
     stream = z_get(guest_strm, true);
+    z_in(guest_strm, stream);  // fields set before init (legal with real zlib) must survive it
     result = deflateInit2(stream, ctx.a(1), ctx.a(2), ctx.a(3), ctx.a(4), ctx.a(5));
     z_out(guest_strm, stream);
   } else {

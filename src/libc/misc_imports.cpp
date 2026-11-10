@@ -1,9 +1,14 @@
 // Process, environment, dynamic-loader and math-classification imports.
+#include <map>
+#include <string>
 #include "libc/misc_imports.h"
 
 #include <dlfcn.h>
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <math.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <unistd.h>
@@ -15,6 +20,7 @@
 #include <vector>
 
 #include "libc/forward.h"
+#include "runtime/jit.h"
 
 // ------------------------------------------------------------------ allocator + misc handlers
 // Guest heap is ~1.25 GB: report at most 1 GB of RAM so size-from-RAM caches stay allocatable.
@@ -38,8 +44,27 @@ static void import_errno(Ctx& ctx, const Stub&) {
   ctx.ret(thread_errno_addr());
 }
 
-static void abort_process(Ctx& ctx, const Stub&) {
-  LOG("guest abort()");
+static void abort_process(Ctx& ctx, const Stub& stub) {
+  LOG("guest %s() called, lr=%08x sp=%08x", stub.name, ctx.cpu->jit->Regs()[14], ctx.sp);
+  // A32_ABORT_DUMP=<hexaddr>:<hexlen>[,...]: write those guest ranges to /tmp/a32_abort_<hexaddr>.bin (post-mortem)
+  if (const char* spec = getenv("A32_ABORT_DUMP")) {
+    std::string list = spec;
+    for (size_t at = 0; at < list.size();) {
+      size_t end = list.find(',', at);
+      if (end == std::string::npos)
+        end = list.size();
+      unsigned long addr = 0, len = 0;
+      if (sscanf(list.substr(at, end - at).c_str(), "%lx:%lx", &addr, &len) == 2) {
+        char path[64];
+        snprintf(path, sizeof path, "/tmp/a32_abort_%lx.bin", addr);
+        if (FILE* f = fopen(path, "wb")) {
+          fwrite(H((u32)addr), 1, len, f);
+          fclose(f);
+        }
+      }
+      at = end + 1;
+    }
+  }
   abort();
 }
 
@@ -61,8 +86,72 @@ static void import_dl_unwind_find_exidx(Ctx& ctx, const Stub&) {  // dl_unwind_f
     ctx.ret(0);
 }
 
+// Old packers ship their own linker: it walks bionic `soinfo` structs reached from the dlopen handle and does its own ELF
+// hash lookup (strtab @0xac, symtab @0xb0, nbucket @0xb4, bucket @0xbc, chain @0xc0, base @0x8c, next @0xa4).
+// So a handle is a fake soinfo whose tables export every symbol the bridge knows (absolute addresses, base 0).
+static u32 build_fake_soinfo(const std::string& name) {
+  static u32 strtab = 0, symtab = 0, buckets = 0, chains = 0, nbucket = 0, nsym = 0;
+  if (!symtab) {
+    std::vector<std::pair<std::string, u32>> syms = sym_all();
+    nsym = (u32)syms.size() + 1;
+    nbucket = 1021;
+    size_t chars = 1;
+    for (auto& sy : syms)
+      chars += sy.first.size() + 1;
+    strtab = gdata_alloc((u32)chars, 4);
+    symtab = gdata_alloc(nsym * 16, 4);
+    buckets = gdata_alloc(nbucket * 4, 4);
+    chains = gdata_alloc(nsym * 4, 4);
+    memset(H(strtab), 0, chars);
+    memset(H(symtab), 0, nsym * 16);
+    memset(H(buckets), 0, nbucket * 4);
+    memset(H(chains), 0, nsym * 4);
+    u32 at = 1, index = 1;
+    for (auto& sy : syms) {
+      memcpy((char*)H(strtab) + at, sy.first.c_str(), sy.first.size() + 1);
+      u32* entry = (u32*)((char*)H(symtab) + index * 16);
+      entry[0] = at;
+      entry[1] = sy.second;
+      entry[2] = 4;
+      ((uint8_t*)entry)[12] = 0x12;  // GLOBAL FUNC
+      ((uint16_t*)entry)[7] = 1;     // defined
+      u32 h = 0;
+      for (unsigned char c : sy.first) {
+        h = (h << 4) + c;
+        u32 g = h & 0xf0000000;
+        h ^= g;
+        h ^= g >> 24;
+      }
+      u32* bucket = (u32*)H(buckets) + h % nbucket;
+      ((u32*)H(chains))[index] = *bucket;
+      *bucket = index;
+      at += (u32)sy.first.size() + 1;
+      index++;
+    }
+  }
+  u32 handle = gdata_alloc(0x200, 4);
+  memset(H(handle), 0, 0x200);
+  strncpy((char*)H(handle), name.c_str(), 127);
+  u32* f = (u32*)H(handle);
+  f[0xac / 4] = strtab;
+  f[0xb0 / 4] = symtab;
+  f[0xb4 / 4] = nbucket;
+  f[0xb8 / 4] = nsym;
+  f[0xbc / 4] = buckets;
+  f[0xc0 / 4] = chains;
+  return handle;
+}
+
 static void import_dlopen(Ctx& ctx, const Stub&) {
-  ctx.ret(1);
+  static std::map<std::string, u32> handles;
+  std::string name = ctx.a(0) ? (const char*)ctx.p(0) : "";
+  size_t slash = name.rfind('/');
+  if (slash != std::string::npos)
+    name = name.substr(slash + 1);
+  u32& handle = handles[name];
+  if (!handle)
+    handle = build_fake_soinfo(name);
+  ctx.ret(handle);
 }
 
 static void import_dlsym(Ctx& ctx, const Stub&) {
@@ -198,6 +287,60 @@ void register_misc_imports() {
   gen("srand48", "i>v");
 
   // process, environment, dynamic loader
+  {
+    // `char** environ`: an empty environment. Packers resolve it by name and give up silently when it is missing.
+    u32 empty_env = gdata_alloc(8, 4);
+    memset(H(empty_env), 0, 8);
+    u32 environ_var = gdata_alloc(4, 4);
+    *(u32*)H(environ_var) = empty_env;
+    sym_add("environ", environ_var);
+  }
+  // epoll: newer packers create one for a watcher thread. There is nothing to watch, so waits just time out.
+  hle("epoll_create", [](Ctx& ctx, const Stub&) { ctx.ret((u32)open("/dev/null", O_RDONLY)); });
+  hle("epoll_create1", [](Ctx& ctx, const Stub&) { ctx.ret((u32)open("/dev/null", O_RDONLY)); });
+  hle("epoll_ctl", return_zero);
+  hle("strsep", [](Ctx& ctx, const Stub&) {  // strsep(char** stringp, const char* delim) on guest memory
+    u32* slot = (u32*)H(ctx.a(0));
+    u32 start = *slot;
+    if (!start) {
+      ctx.ret(0);
+      return;
+    }
+    char* text = (char*)H(start);
+    char* hit = text + strcspn(text, (const char*)ctx.p(1));
+    if (*hit) {
+      *hit = 0;
+      *slot = start + (u32)(hit + 1 - text);
+    } else {
+      *slot = 0;
+    }
+    ctx.ret(start);
+  });
+  hle("pipe", [](Ctx& ctx, const Stub&) {  // pipe(int fds[2]): old packers make one before forking a helper
+    int fds[2];
+    int rc = pipe(fds);
+    if (rc == 0 && ctx.a(0)) {
+      ((int*)H(ctx.a(0)))[0] = fds[0];
+      ((int*)H(ctx.a(0)))[1] = fds[1];
+    }
+    ctx.ret((u32)rc);
+  });
+  hle("realpath", [](Ctx& ctx, const Stub&) {  // realpath(path, resolved): resolved may be null (malloc'd result)
+    u32 out = ctx.a(1) ? ctx.a(1) : gmalloc(4096);
+    char resolved[PATH_MAX];
+    if (!realpath((const char*)ctx.p(0), resolved)) {
+      ctx.ret(0);
+      return;
+    }
+    strcpy((char*)H(out), resolved);
+    ctx.ret(out);
+  });
+  for (const char* name : {"epoll_wait", "epoll_pwait"})
+    hle(name, [](Ctx& ctx, const Stub&) {
+      int timeout_ms = (int)ctx.a(3);
+      usleep((unsigned)std::min(timeout_ms < 0 ? 50 : timeout_ms, 50) * 1000);
+      ctx.ret(0);
+    });
   hle("__errno", import_errno);
   hle("abort", abort_process);
   hle("exit", exit_process);

@@ -51,7 +51,7 @@ u32 jni_guest_vm() {
 // The app's native library directory, "" if it cannot be determined. The application object does not exist yet when a
 // library is loaded from Application.attachBaseContext, so the directory is derived from where the APK is mapped:
 // /data/app/<package>-<id>/base.apk -> /data/app/<package>-<id>/lib/arm64.
-static std::string native_library_dir() {
+std::string native_library_dir() {
   FILE* maps = fopen("/proc/self/maps", "r");
   if (!maps)
     return "";
@@ -74,6 +74,26 @@ static std::string native_library_dir() {
   return result;
 }
 
+// DER of the original signing certificate, shipped by port_apk.py as liba32sig.so in the native library directory
+// (the ported APK is re-signed). Empty when the file is missing: signature answers are then left to the real system.
+const std::string& original_certificate() {
+  static std::string cert;
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    std::string dir = native_library_dir();
+    if (!dir.empty())
+      if (FILE* f = fopen((dir + "/liba32sig.so").c_str(), "rb")) {
+        char chunk[4096];
+        size_t got;
+        while ((got = fread(chunk, 1, sizeof chunk, f)) > 0)
+          cert.append(chunk, got);
+        fclose(f);
+      }
+  }
+  return cert;
+}
+
 extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
   // The whole 4 GiB guest address space is one lazily-committed host reservation.
   void* reservation =
@@ -88,6 +108,7 @@ extern "C" JNIEXPORT jint JNI_OnLoad(JavaVM* java_vm, void*) {
   libc_init();
   kuser_init();
   jni_init(java_vm);
+  dexload_init();
   sles_init();
 
   // lib<name>.so -> lib<name>_a32.so, in the same directory

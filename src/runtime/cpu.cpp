@@ -191,7 +191,8 @@ void Cpu::CallSVC(u32 idx) {
   {
     static std::atomic<unsigned> n;
     unsigned k = n++;
-    if (k < A32_TRACE_LIMIT || k % 200000 == 0) {
+    static const unsigned from = getenv("A32_TRACE_FROM") ? (unsigned)atoi(getenv("A32_TRACE_FROM")) : 0xffffffffu;
+    if (k < A32_TRACE_LIMIT || k % 200000 == 0 || k >= from) {
       auto& r = jit->Regs();
       LOG("stub#%u %s lr=%08x r0=%08x r1=%08x r2=%08x %s", k, stub->name, r[14], r[0], r[1], r[2],
           traced_string(stub->name, r));

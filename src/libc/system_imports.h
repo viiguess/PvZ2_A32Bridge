@@ -15,6 +15,7 @@ void install_fake_proc_maps();
 // Lists a companion library (a mod loaded next to the guest) in the synthetic /proc/self/maps as well.
 struct Image;
 void fake_proc_maps_add(const Image& image);
+void fake_proc_maps_add_region(u32 base, u32 size, const std::string& name);  // a non-library mapping (e.g. a dex)
 // The name the guest sees for a library path: lib<name>_a32.so -> lib<name>.so.
 std::string shown_name(const std::string& path);
 
@@ -25,3 +26,6 @@ void install_syscalls();
 // fields of the result. The registered stubs return this object: a DexFile whose virtual methods all return 0 and
 // whose first fields point at the dex. fake_dex_file() builds it for a dex at `base` with `size` bytes.
 u32 fake_dex_file(u32 base, u32 size);
+// Called with every dex the packer hands over (pointer into guest memory, size). The Android bridge sets it to load the
+// classes into the app's class loader, because it cannot register the dex with ART the way the packer does.
+extern void (*g_dex_handover_hook)(const uint8_t* dex, u32 size);

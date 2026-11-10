@@ -35,6 +35,7 @@ void generic(Ctx& ctx, const Stub& stub) {
   u64 int_args[10] = {0};
   double float_args[8] = {0};
   int int_count = 0, float_count = 0, arg_index = 0;
+  u32 guest_stream = 0;  // first FILE argument: its end-of-file and error state is mirrored into the guest struct
   const char* cursor = stub.sig;
   for (; *cursor && *cursor != '>'; cursor++) {
     switch (*cursor) {
@@ -46,6 +47,8 @@ void generic(Ctx& ctx, const Stub& stub) {
         int_args[int_count++] = value < 0x10000 ? value : (u64)(uintptr_t)H(value);
       } break;
       case 'F':
+        if (!guest_stream)
+          guest_stream = ctx.a(arg_index);
         int_args[int_count++] = (u64)(uintptr_t)file_host(ctx.a(arg_index++));
         break;
       case 'i':
@@ -101,6 +104,15 @@ void generic(Ctx& ctx, const Stub& stub) {
   u64 result = ((FnI)stub.fn)(A);
 #undef A
   set_errno();
+  // Old bionic headers inline feof()/ferror() as tests of sFILE::_flags (offset 12: __SEOF 0x20, __SERR 0x40), so a
+  // loop such as "while (!feof(f)) fgets(...)" only ends when the guest struct carries the host stream's state.
+  if (guest_stream) {
+    FILE* host = file_host(guest_stream);
+    if (host) {
+      uint16_t* flags = (uint16_t*)((uint8_t*)H(guest_stream) + 12);
+      *flags = (uint16_t)((*flags & ~0x60) | (feof(host) ? 0x20 : 0) | (ferror(host) ? 0x40 : 0));
+    }
+  }
   switch (return_kind) {
     case 'q':
       ctx.ret64(result);
