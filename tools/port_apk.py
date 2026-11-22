@@ -4,8 +4,8 @@
     apktool d game.apk -o decoded
     python port_apk.py decoded build_arm64/libGame.so ported --bridge build_x86_64/libGame.so \
         [--pin-intents com/example/BootReceiver.smali]
-    apktool b -api 30 ported -o game_unsigned.apk        # then zipalign + apksign it
-    (without -api 30 the dex targets minSdk and Java 8 interface methods fail with IncompatibleClassChangeError)
+    apktool b -api 28 ported -o game_unsigned.apk        # then zipalign + apksign it
+    (without -api 28 the dex targets minSdk and Java 8 interface methods fail with IncompatibleClassChangeError)
 
 What it does:
   1. For each bridge (positional and --bridge; the ABI, arm64-v8a or x86_64, comes from the ELF header):
@@ -227,12 +227,35 @@ def pad_abi_dirs(out, abis, stubs):
     return count
 
 
+# AndroidPurchaseDriver::GetTodayRechargeMax / GetMonthRechargeMax return the payment adapter's cap, or 999999 when no
+# adapter is set. ARM code: `cmp r0, #0; beq no_adapter` ... `ldr r0, [pc]` with the literal 999999. Making the branch
+# unconditional gives every purchase the 999999 cap, which lifts the daily and monthly recharge limits.
+RECHARGE_CAP = re.compile(
+    rb'(\x00\x48\x2d\xe9\x08\x00\x90\xe5\x04\xb0\x8d\xe2\x00\x00\x50\xe3)\x03\x00\x00\x0a'
+    rb'(\x00\x30\x90\xe5[\x2c\x30]\x30\x93\xe5\x33\xff\x2f\xe1\x00\x88\xbd\xe8\x00\x00\x9f\xe5\x00\x88\xbd\xe8\x3f\x42\x0f\x00)',
+    re.S)
+
+
+def lift_recharge_limits(library):
+    """Patches the game library at `library` in place. Returns how many cap functions were changed."""
+    with open(library, 'rb') as f:
+        data = f.read()
+    patched, count = RECHARGE_CAP.subn(lambda m: m.group(1) + b'\x03\x00\x00\xea' + m.group(2), data)
+    if count:
+        with open(library, 'wb') as f:
+            f.write(patched)
+    return count
+
+
 def install_libraries(out, bridges, name, keep_32bit=True):
     """`bridges`: {abi: bridge library}."""
     lib = os.path.join(out, 'lib')
     original = original_library(lib, name)
     if original is None:
         sys.exit('no lib%s.so found under lib/armeabi{,-v7a}' % name)
+    lifted = lift_recharge_limits(original)
+    if lifted:
+        print('recharge limits lifted: %d function(s) patched in %s' % (lifted, os.path.basename(original)))
     for abi, bridge in sorted(bridges.items()):
         target = os.path.join(lib, abi)
         os.makedirs(target, exist_ok=True)
@@ -279,7 +302,7 @@ def patch_manifest(out):
                         '    <uses-library android:name="org.apache.http.legacy" android:required="false"/>\n'
                         '    </application>', 1)
     text = text.replace('android:debuggable="true" ', '')
-    text = re.sub(r'\s+android:qihoo="[^"]*"', '', text)  # 360 Jiagu marker; aapt2 rejects the unknown attribute
+    text = re.sub(r'\s+android:(?:qihoo|protect)="[^"]*"', '', text)  # 360 Jiagu markers; aapt2 rejects the unknown attributes
     write(path, text)
     match = re.search(r'package="([^"]+)"', text)
     return match.group(1) if match else None
@@ -377,6 +400,32 @@ SAFE_IMEI_METHOD = '''.method public static {helper}(L{tm};)Ljava/lang/String;
 .end method
 '''
 
+# getSubscriberId: the game picks its payment channel from the carrier code in the IMSI (46000 China Mobile, 46001 China
+# Unicom, 46003 China Telecom) and reports a connection error on a purchase when none matches. A device without a
+# Chinese SIM, or without the permission to read it, reports a China Unicom IMSI instead.
+SAFE_IMSI_METHOD = '''.method public static imsi(L{tm};)Ljava/lang/String;
+    .locals 2
+    :try_start
+    invoke-virtual {{p0}}, L{tm};->getSubscriberId()Ljava/lang/String;
+    move-result-object v0
+    :try_end
+    .catch Ljava/lang/Throwable; {{:try_start .. :try_end}} :handler
+    :done
+    if-eqz v0, :fallback
+    const-string v1, "460"
+    invoke-virtual {{v0, v1}}, Ljava/lang/String;->startsWith(Ljava/lang/String;)Z
+    move-result v1
+    if-nez v1, :keep
+    :fallback
+    const-string v0, "460011000000000"
+    :keep
+    return-object v0
+    :handler
+    const/4 v0, 0x0
+    goto :done
+.end method
+'''
+
 # WifiInfo.getMacAddress: Android masks the MAC (02:00:00:00:00:00) for apps; InstallIds supplies a per-device one
 WIFI = 'Landroid/net/wifi/WifiInfo;'
 WIFI_MAC_CALL = re.compile(r'invoke-virtual \{([^}]*)\}, %s->getMacAddress\(\)Ljava/lang/String;' % WIFI)
@@ -403,6 +452,8 @@ INSTALL_IDS_SMALI = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'in
 def safe_ids_method(method, with_slot):
     if method in ('getDeviceId', 'getImei') and not with_slot:
         return SAFE_IMEI_METHOD.format(helper=GUARDED_TELEPHONY[method], tm=TELEPHONY[1:-1], method=method)
+    if method == 'getSubscriberId' and not with_slot:
+        return SAFE_IMSI_METHOD.format(tm=TELEPHONY[1:-1])
     return SAFE_IDS_METHOD.format(
         helper=GUARDED_TELEPHONY[method] + ('Slot' if with_slot else ''), tm=TELEPHONY[1:-1], method=method,
         param='I' if with_slot else '', regs='p0, p1' if with_slot else 'p0')
@@ -462,12 +513,15 @@ def default_return(ret):
     return '    const/4 v0, 0x0\n    return v0'
 
 
-def stub_foreign_natives(out, keep=('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo', 'com/jg/', 'com/unicom/shield/',
-                                    'com/common/busi/CustomView')):
+JIAGU_KEEP = ('com/jg/', 'com/unicom/shield/', 'com/common/busi/CustomView')
+
+
+def stub_foreign_natives(out, keep=('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo')):
     """Native methods of SDK classes live in 32-bit libraries the bridge cannot load, so calling them throws
     UnsatisfiedLinkError (often on a worker thread, which kills the process). They are turned into methods that return
     0 / null / void. Classes under the `keep` prefixes (the game, the Marmalade loader and the packer stub) are left
-    alone: their natives come from the game library or the packer. Returns the number of methods stubbed."""
+    alone: their natives come from the game library or the packer (a Jiagu game passes JIAGU_KEEP as well: the
+    natives of the packer's support classes are bound by the packer). Returns the number of methods stubbed."""
     count = 0
 
     def stub(m):
@@ -503,6 +557,16 @@ def add_unpacked_dex(out, dex, baksmali):
     while os.path.exists(os.path.join(out, 'smali_classes%d' % number)):
         number += 1
     target = os.path.join(out, 'smali_classes%d' % number)
+    if os.path.basename(baksmali).lower().startswith('apktool'):
+        # apktool.jar decodes the dex when it is wrapped as classes.dex of a resource-less APK.
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            wrapper = os.path.join(tmp, 'dex.apk')
+            with zipfile.ZipFile(wrapper, 'w') as z:
+                z.write(dex, 'classes.dex')
+            subprocess.run(['java', '-jar', baksmali, 'd', '-r', '-f', '-o', os.path.join(tmp, 'out'), wrapper], check=True)
+            shutil.copytree(os.path.join(tmp, 'out', 'smali'), target)
+        return target
     subprocess.run(['java', '-jar', baksmali, 'd', dex, '-o', target], check=True)
     return target
 
@@ -680,6 +744,38 @@ def guard_unicom_wrapper(out):
         return '%sif-eqz %s, %s\n\n    %s    %s' % (m.group(1), m.group(2), label, m.group(3), label)
 
     write(path, WRAPPED_CALL.sub(guard, read(path)))
+    return count
+
+
+UNICOM_INIT_CALL = re.compile(
+    r'^([ \t]*)(invoke-virtual \{[^}]*\}, Lcom/unicom/dcLoader/Utils;->initSDK\([^\n]*\n)', re.M)
+UNICOM_INIT_GUARD = """{i}:unicom_init_start_{n}
+{i}{call}{i}:unicom_init_end_{n}
+{i}.catch Ljava/lang/Throwable; {{:unicom_init_start_{n} .. :unicom_init_end_{n}}} :unicom_init_done_{n}
+{i}:unicom_init_done_{n}
+"""
+
+
+def guard_unicom_init(out):
+    """The application of the Unicom dcLoader builds calls Utils.initSDK from onCreate. initSDK writes its encrypted
+    native (decrypt.so) into the app's data folder and loads it, and that load fails here with an UnsatisfiedLinkError
+    that ends the process: catch it so the game starts without the SDK."""
+    count = 0
+
+    def wrap(m):
+        nonlocal count
+        count += 1
+        return UNICOM_INIT_GUARD.format(i=m.group(1), call=m.group(2), n=count)
+
+    for smali_dir in smali_dirs(out):
+        for root, _dirs, files in os.walk(smali_dir):
+            if '/com/unicom/' in root.replace('\\', '/') + '/':
+                continue
+            for name in files:
+                path = os.path.join(root, name)
+                if not name.endswith('.smali') or 'Lcom/unicom/dcLoader/Utils;->initSDK' not in read(path):
+                    continue
+                write(path, UNICOM_INIT_CALL.sub(wrap, read(path)))
     return count
 
 
@@ -882,11 +978,17 @@ def main():
     removed = remove_muzhiwan(args.out)
     if removed:
         print('Muzhiwan embed SDK removed: %d PopUtils methods turned into no-ops, game activity is the launcher' % removed)
+    initialised = guard_unicom_init(args.out)
+    if initialised:
+        print('Unicom SDK initialisation guarded: %d call(s)' % initialised)
     guarded, skipped = guard_unicom_wrapper(args.out), skip_talkweb_init(args.out)
     if guarded or skipped:
         print('Talkweb/Unicom SDK patches: %d Unicom call(s) guarded, Talkweb init %s'
               % (guarded, 'skipped' if skipped else 'left alone'))
-    print('SDK native methods stubbed: %d' % stub_foreign_natives(args.out))
+    keep = ('com/popcap/', 'com/ideaworks3d/marmalade/', 'com/stub/', 'com/qihoo')
+    if args.jiagu_bridge or args.jiagu_dex:
+        keep += JIAGU_KEEP
+    print('SDK native methods stubbed: %d' % stub_foreign_natives(args.out, keep))
     print('telephony / Wi-Fi identifier calls rewritten: %d' % guard_identifier_calls(args.out))
     print('ported ->', args.out)
 

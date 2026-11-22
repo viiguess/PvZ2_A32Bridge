@@ -42,6 +42,9 @@ void generic(Ctx& ctx, const Stub& stub) {
       case 'p':
         int_args[int_count++] = (u64)(uintptr_t)H(ctx.a(arg_index++));
         break;
+      case 's':
+        int_args[int_count++] = (u64)(uintptr_t)guest_host_path((const char*)H(ctx.a(arg_index++)));
+        break;
       case 'o': {
         u32 value = ctx.a(arg_index++);
         int_args[int_count++] = value < 0x10000 ? value : (u64)(uintptr_t)H(value);

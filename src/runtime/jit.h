@@ -84,6 +84,13 @@ struct Cpu final : Dynarmic::A32::UserCallbacks {
         reg(13));
     LOG("  r0-r3 %08x %08x %08x %08x r4-r7 %08x %08x %08x %08x r8-r12 %08x %08x %08x %08x %08x", reg(0), reg(1), reg(2),
         reg(3), reg(4), reg(5), reg(6), reg(7), reg(8), reg(9), reg(10), reg(11), reg(12));
+    u32 code = reg(15) & ~1u;
+    if (mapped(code) && mapped(code + 31)) {
+      char hex[80] = {};
+      for (int i = 0; i < 32; i++)
+        snprintf(hex + i * 2, 3, "%02x", G[code + i]);
+      LOG("  code at pc: %s", hex);
+    }
     fault = true;
     jit->HaltExecution();
   }

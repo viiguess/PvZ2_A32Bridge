@@ -10,6 +10,7 @@
 #include <string.h>
 #include <sys/system_properties.h>
 #include <unistd.h>
+#include <zlib.h>
 
 #include <string>
 #include <utility>
@@ -174,6 +175,97 @@ void install_image(const std::vector<std::string>& names, const char* guest_path
   LOG("jiagu compat: fake %s (%d symbols) at %08x", guest_path, listed, base);
 }
 
+// The shell classes.dex of the APK, inflated into the guest and listed in the fake /proc/self/maps under the name the
+// runtime gives its mapping. Old packers find it there and read their payload from it.
+void map_shell_dex() {
+  std::string libdir = native_library_dir();
+  size_t lib = libdir.rfind("/lib/");
+  if (lib == std::string::npos)
+    return;
+  FILE* f = fopen((libdir.substr(0, lib) + "/base.apk").c_str(), "rb");
+  if (!f)
+    return;
+  auto u16 = [](const uint8_t* p) { return (uint32_t)p[0] | (uint32_t)p[1] << 8; };
+  auto u32le = [&](const uint8_t* p) { return u16(p) | u16(p + 2) << 16; };
+  fseek(f, 0, SEEK_END);
+  long size = ftell(f);
+  long tail = size < 70000 ? size : 70000;
+  std::vector<uint8_t> end(tail);
+  fseek(f, size - tail, SEEK_SET);
+  if (fread(end.data(), 1, tail, f) != (size_t)tail) {
+    fclose(f);
+    return;
+  }
+  long eocd = -1;
+  for (long i = tail - 22; i >= 0; i--)
+    if (u32le(&end[i]) == 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  if (eocd < 0) {
+    fclose(f);
+    return;
+  }
+  uint32_t count = u16(&end[eocd + 10]), directory_size = u32le(&end[eocd + 12]), directory_at = u32le(&end[eocd + 16]);
+  std::vector<uint8_t> directory(directory_size);
+  fseek(f, directory_at, SEEK_SET);
+  if (fread(directory.data(), 1, directory_size, f) != directory_size) {
+    fclose(f);
+    return;
+  }
+  uint32_t entry = 0, method = 0, packed = 0, unpacked = 0, local = 0;
+  for (uint32_t at = 0, n = 0; n < count && at + 46 <= directory_size; n++) {
+    const uint8_t* e = &directory[at];
+    uint32_t name_length = u16(e + 28), extra_length = u16(e + 30), comment_length = u16(e + 32);
+    if (name_length == 11 && !memcmp(e + 46, "classes.dex", 11)) {
+      entry = 1;
+      method = u16(e + 10);
+      packed = u32le(e + 20);
+      unpacked = u32le(e + 24);
+      local = u32le(e + 42);
+      break;
+    }
+    at += 46 + name_length + extra_length + comment_length;
+  }
+  if (!entry) {
+    fclose(f);
+    return;
+  }
+  uint8_t header[30];
+  fseek(f, local, SEEK_SET);
+  if (fread(header, 1, 30, f) != 30) {
+    fclose(f);
+    return;
+  }
+  fseek(f, local + 30 + u16(header + 26) + u16(header + 28), SEEK_SET);
+  std::vector<uint8_t> data(packed);
+  if (fread(data.data(), 1, packed, f) != packed) {
+    fclose(f);
+    return;
+  }
+  fclose(f);
+  std::vector<uint8_t> dex(unpacked);
+  if (method == 0) {
+    dex = data;
+  } else {
+    z_stream stream = {};
+    stream.next_in = data.data();
+    stream.avail_in = packed;
+    stream.next_out = dex.data();
+    stream.avail_out = unpacked;
+    if (inflateInit2(&stream, -15) != Z_OK)
+      return;
+    int status = inflate(&stream, Z_FINISH);
+    inflateEnd(&stream);
+    if (status != Z_STREAM_END)
+      return;
+  }
+  u32 base = gdata_alloc((u32)dex.size() + 16, 0x1000);
+  memcpy(H(base), dex.data(), dex.size());
+  fake_proc_maps_add_region(base, (u32)dex.size(), "/data/dalvik-cache/arm/data@app@" + package_name() + "-1@base.apk@classes.dex");
+  LOG("jiagu compat: shell classes.dex (%zu bytes) at %08x", dex.size(), base);
+}
+
 }  // namespace
 
 void jiagu_compat_init() {
@@ -211,5 +303,6 @@ void jiagu_compat_init() {
   memcpy(H(var), oat, 3);
   sym_add("_ZN3art9OatHeader11kOatVersionE", var);
   install_image(names, "/system/lib/libart.so", "a32_libart.so", 0x4000);
+  map_shell_dex();
   install_image({"rtld_db_dlactivity"}, "/system/bin/linker", "a32_linker.so", 0x1000);
 }

@@ -123,13 +123,24 @@ static void load_dex_into_app_loader(const uint8_t* dex, u32 size) {
     return;
   jni->PushLocalFrame(64);
   // The class that called System.load (the packer's StubApp) belongs to the app's class loader.
+  jclass class_class = jni->FindClass("java/lang/Class");
+  jobject app_loader = nullptr;
   jclass stub = jni->FindClass("com/stub/StubApp");
-  if (clear_exception(jni, "FindClass StubApp") || !stub) {
+  if (!clear_exception(jni, "FindClass StubApp") && stub)
+    app_loader = jni->CallObjectMethod(stub, jni->GetMethodID(class_class, "getClassLoader", "()Ljava/lang/ClassLoader;"));
+  if (!app_loader) {  // packers whose shell class has another name: the main thread's context loader is the app loader
+    jclass thread_class = jni->FindClass("java/lang/Thread");
+    jobject thread = jni->CallStaticObjectMethod(
+        thread_class, jni->GetStaticMethodID(thread_class, "currentThread", "()Ljava/lang/Thread;"));
+    if (thread)
+      app_loader = jni->CallObjectMethod(
+          thread, jni->GetMethodID(thread_class, "getContextClassLoader", "()Ljava/lang/ClassLoader;"));
+    clear_exception(jni, "context class loader");
+  }
+  if (!app_loader) {
     jni->PopLocalFrame(nullptr);
     return;
   }
-  jclass class_class = jni->FindClass("java/lang/Class");
-  jobject app_loader = jni->CallObjectMethod(stub, jni->GetMethodID(class_class, "getClassLoader", "()Ljava/lang/ClassLoader;"));
 
   uint8_t* copy = (uint8_t*)malloc(size);  // kept for the life of the process: the loader maps the buffer
   memcpy(copy, dex, size);

@@ -6,6 +6,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <stdio.h>
 #include <netdb.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -26,6 +27,7 @@
 #include "libc/format.h"
 #include "libc/forward.h"
 #include "libc/guest_abi.h"
+#include "libc/log_relay.h"
 
 // ---------------------------------------------------------------------------------------------------------------
 // Guest FILE objects (layout in guest_abi.h). stdin/stdout/stderr map to the host streams; with logging enabled,
@@ -155,7 +157,135 @@ static const char* legacy_system_path(const char* path) {
   return path;
 }
 
+// The game keeps its profile and level data in <app dir>/filesNo_Backup. The folder is served from the app's own
+// directory on shared storage (Android/data/<package>/), where a file manager or a USB connection can reach it.
+// Data already in the internal folder is copied across once and the internal folder is renamed to <name>.migrated.
+namespace {
+
+struct SaveRedirect {
+  bool enabled = false;
+  std::string external;                // /storage/emulated/<user>/Android/data/<package>
+  std::vector<std::string> internals;  // the internal app directory under each of its names
+};
+
+const char* const kSaveFolders[] = {"filesNo_Backup", "No_Backup", "no_backup"};
+
+bool make_dirs(const std::string& path) {
+  for (size_t at = 1; at <= path.size(); at++) {
+    if (at == path.size() || path[at] == '/') {
+      std::string part = path.substr(0, at);
+      if (mkdir(part.c_str(), 0770) != 0 && errno != EEXIST && access(part.c_str(), F_OK) != 0)
+        return false;
+    }
+  }
+  return true;
+}
+
+void copy_tree(const std::string& from, const std::string& to) {
+  make_dirs(to);
+  DIR* dir = opendir(from.c_str());
+  if (!dir)
+    return;
+  while (dirent* entry = readdir(dir)) {
+    std::string name = entry->d_name;
+    if (name == "." || name == "..")
+      continue;
+    std::string source = from + "/" + name, target = to + "/" + name;
+    struct stat info;
+    if (stat(source.c_str(), &info) != 0)
+      continue;
+    if (S_ISDIR(info.st_mode)) {
+      copy_tree(source, target);
+    } else if (S_ISREG(info.st_mode)) {
+      FILE* in = fopen(source.c_str(), "rb");
+      FILE* out = in ? fopen(target.c_str(), "wb") : nullptr;
+      if (in && out) {
+        char buffer[16384];
+        size_t count;
+        while ((count = fread(buffer, 1, sizeof buffer, in)) > 0)
+          fwrite(buffer, 1, count, out);
+      }
+      if (out)
+        fclose(out);
+      if (in)
+        fclose(in);
+    }
+  }
+  closedir(dir);
+}
+
+SaveRedirect& save_redirect() {
+  static SaveRedirect redirect;
+  static std::once_flag once;
+  std::call_once(once, [] {
+    char name[256] = {0};
+    FILE* cmdline = fopen("/proc/self/cmdline", "r");
+    if (cmdline) {
+      size_t length = fread(name, 1, sizeof name - 1, cmdline);
+      name[length] = 0;
+      fclose(cmdline);
+    }
+    std::string package = name;
+    package = package.substr(0, package.find(':'));
+    if (package.find('.') == std::string::npos || package.find('/') != std::string::npos)
+      return;
+
+    int user = (int)(getuid() / 100000);
+    std::string external = "/storage/emulated/" + std::to_string(user) + "/Android/data/" + package;
+    if (!make_dirs(external) || access(external.c_str(), W_OK) != 0)
+      return;
+
+    SaveRedirect& r = redirect;
+    r.external = external;
+    r.internals = {"/data/data/" + package, "/data/user/" + std::to_string(user) + "/" + package,
+                   "/data/user/0/" + package};
+    for (const char* folder : kSaveFolders) {
+      for (const std::string& base : r.internals) {
+        std::string internal = base + "/" + folder, target = external + "/" + folder;
+        struct stat info;
+        if (stat(internal.c_str(), &info) != 0 || !S_ISDIR(info.st_mode))
+          continue;
+        if (access(target.c_str(), F_OK) != 0)
+          copy_tree(internal, target);
+        rename(internal.c_str(), (internal + ".migrated").c_str());
+        break;
+      }
+    }
+    for (const char* folder : kSaveFolders)
+      make_dirs(external + "/" + folder);
+    r.enabled = true;
+  });
+  return redirect;
+}
+
+// The shared-storage path for a path inside one of the save folders, or null.
+const char* redirected_save_path(const char* path) {
+  if (path[0] != '/' || strncmp(path, "/data/", 6) != 0)
+    return nullptr;
+  SaveRedirect& r = save_redirect();
+  if (!r.enabled)
+    return nullptr;
+  for (const std::string& base : r.internals) {
+    if (strncmp(path, base.c_str(), base.size()) != 0 || path[base.size()] != '/')
+      continue;
+    const char* rest = path + base.size() + 1;
+    for (const char* folder : kSaveFolders) {
+      size_t length = strlen(folder);
+      if (strncmp(rest, folder, length) == 0 && (rest[length] == 0 || rest[length] == '/')) {
+        static thread_local std::string redirected;
+        redirected = r.external + "/" + rest;
+        return redirected.c_str();
+      }
+    }
+  }
+  return nullptr;
+}
+
+}  // namespace
+
 const char* guest_host_path(const char* guest_path) {
+  if (const char* redirected = redirected_save_path(guest_path))
+    return redirected;
   return legacy_system_path(g_path_hook ? g_path_hook(guest_path) : guest_path);
 }
 
@@ -184,9 +314,9 @@ static void import_utime(Ctx& ctx, const Stub&) {
     utimbuf times;
     times.actime = (int32_t)((u32*)ctx.p(1))[0];
     times.modtime = (int32_t)((u32*)ctx.p(1))[1];
-    result = utime((const char*)ctx.p(0), &times);
+    result = utime(guest_host_path((const char*)ctx.p(0)), &times);
   } else
-    result = utime((const char*)ctx.p(0), nullptr);
+    result = utime(guest_host_path((const char*)ctx.p(0)), nullptr);
   set_errno();
   ctx.ret(result);
 }
@@ -517,6 +647,74 @@ static void import_gethostbyname(Ctx& ctx, const Stub&) {
   ctx.ret(g_hostent);
 }
 
+// getaddrinfo / freeaddrinfo / gai_strerror, IPv4 only. A guest addrinfo is bionic's 32-byte layout
+// { flags, family, socktype, protocol, addrlen, canonname*, addr*, next* } followed by its 16-byte sockaddr_in;
+// freed blocks are kept for the next call.
+enum : u32 { GUEST_ADDRINFO_SIZE = 32 + 16, EAI_NONAME_CODE = 8 };
+static std::mutex g_addrinfo_mutex;
+static std::vector<u32> g_addrinfo_free;
+
+static void import_getaddrinfo(Ctx& ctx, const Stub&) {
+  const char* node = (const char*)ctx.p(0);
+  const char* service = ctx.a(1) ? (const char*)ctx.p(1) : nullptr;
+  u32* out = (u32*)ctx.p(3);
+  if (!node || !out) {
+    ctx.ret(EAI_NONAME_CODE);
+    return;
+  }
+  addrinfo hints = {};
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  addrinfo* result = nullptr;
+  if (getaddrinfo(node, nullptr, &hints, &result) != 0 || !result) {
+    LOG("getaddrinfo(%s) failed", node);
+    *out = 0;
+    ctx.ret(EAI_NONAME_CODE);
+    return;
+  }
+  u32 block;
+  {
+    std::lock_guard<std::mutex> lock(g_addrinfo_mutex);
+    if (g_addrinfo_free.empty()) {
+      block = gdata_alloc(GUEST_ADDRINFO_SIZE, 8);
+    } else {
+      block = g_addrinfo_free.back();
+      g_addrinfo_free.pop_back();
+    }
+  }
+  sockaddr_in address = *(sockaddr_in*)result->ai_addr;
+  address.sin_port = htons((unsigned short)(service ? atoi(service) : 0));
+  freeaddrinfo(result);
+  u32* info = (u32*)H(block);
+  info[0] = 0;
+  info[1] = AF_INET;
+  info[2] = SOCK_STREAM;
+  info[3] = IPPROTO_TCP;
+  info[4] = sizeof(sockaddr_in);
+  info[5] = 0;
+  info[6] = block + 32;
+  info[7] = 0;
+  memcpy(H(block + 32), &address, sizeof address);
+  *out = block;
+  ctx.ret(0);
+}
+
+static void import_freeaddrinfo(Ctx& ctx, const Stub&) {
+  if (!ctx.a(0))
+    return;
+  std::lock_guard<std::mutex> lock(g_addrinfo_mutex);
+  g_addrinfo_free.push_back(ctx.a(0));
+}
+
+static void import_gai_strerror(Ctx& ctx, const Stub&) {
+  static u32 text = 0;
+  if (!text) {
+    text = gdata_alloc(32, 4);
+    strcpy((char*)H(text), "name resolution failed");
+  }
+  ctx.ret(text);
+}
+
 static void import_inet_ntoa(Ctx& ctx, const Stub&) {  // struct in_addr is passed by value: one u32
   static u32 buffer = gdata_alloc(16, 4);
   in_addr address;
@@ -591,13 +789,19 @@ void register_stdio_imports() {
 
   // files and directories
   gen("ftruncate", "ii>i");
-  gen("rename", "pp>i");
+  gen("rename", "ss>i");
   hle("access", import_access);
-  gen("mkdir", "pu>i");
-  gen("unlink", "p>i");
-  gen("rmdir", "p>i");
+  gen("mkdir", "su>i");
+  gen("unlink", "s>i");
+  gen("rmdir", "s>i");
   gen("chdir", "p>i");
-  gen("chmod", "pu>i");
+  hle("chmod", [](Ctx& ctx, const Stub&) {  // shared storage ignores modes
+    const char* path = (const char*)ctx.p(0);
+    const char* host = guest_host_path(path);
+    int result = host != path ? 0 : chmod(host, ctx.a(1));
+    set_errno();
+    ctx.ret(result);
+  });
   gen("getcwd", "pu>P");
   gen("readlink", "ppu>i");
   gen("fsync", "i>i");
@@ -622,7 +826,25 @@ void register_stdio_imports() {
   // sockets
   gen("socket", "iii>i");
   gen("setsockopt", "iiipu>i");
-  gen("connect", "ipu>i");
+  hle("connect", [](Ctx& ctx, const Stub&) {
+    const sockaddr* address = (const sockaddr*)ctx.p(1);
+    if (ctx.a(2) >= sizeof(sockaddr_in)) {
+      LogRelay relay = log_relay_connect((int)ctx.a(0), *(const sockaddr_in*)address);
+      if (relay == LogRelay::Relayed) {
+        ctx.ret(0);
+        return;
+      }
+      if (relay == LogRelay::Refused) {
+        errno = ECONNREFUSED;
+        set_errno();
+        ctx.ret((u32)-1);
+        return;
+      }
+    }
+    int result = connect((int)ctx.a(0), address, ctx.a(2));
+    set_errno();
+    ctx.ret((u32)result);
+  });
   gen("bind", "ipu>i");
   gen("listen", "ii>i");
   gen("accept", "ipp>i");
@@ -646,5 +868,8 @@ void register_stdio_imports() {
   gen("gethostname", "pu>i");
   gen("inet_addr", "p>u");
   hle("gethostbyname", import_gethostbyname);
+  hle("getaddrinfo", import_getaddrinfo);
+  hle("freeaddrinfo", import_freeaddrinfo);
+  hle("gai_strerror", import_gai_strerror);
   hle("inet_ntoa", import_inet_ntoa);
 }

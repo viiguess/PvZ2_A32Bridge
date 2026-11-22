@@ -116,7 +116,7 @@ Options:
    APK's original signature and warns if it differs; then rebuild the bridge with `-DORIG_SIG_HASH=<value>`. Read its
    output: it lists implicit service intents that Android 5+ rejects; pin the ones that belong to the app with
    `--pin-intents`.
-4. `apktool b -api 30 ported -o game.apk`, then `zipalign` and sign it. Without `-api 30` the dex targets the
+4. `apktool b -api 28 ported -o game.apk`, then `zipalign` and sign it. Without `-api 28` the dex targets the
    manifest's `minSdkVersion` and AndroidX/Kotlin code fails with `IncompatibleClassChangeError`.
 
 `port_apk.py` also prepares the SDKs inside the APK for a 64-bit process and modern Android: native methods of SDK
@@ -168,9 +168,44 @@ and login SDKs) still cannot run; `port_apk.py` makes the Chinese Plants vs. Zom
 
 | Tool | Purpose |
 | --- | --- |
+| `tools/build_apk.py` | One command from a game APK to a ready APK: picks the route, builds the bridges, ports, signs, optionally patches for a server and installs (see *Building an APK in one command*) |
 | `tools/port_apk.py` | Prepares a decoded APK for the bridge (see above); `port_apk.py finish` restores the packed dex of a packed game |
 | `tools/install_ids/` | Java helper that `port_apk.py` adds to the APK: gives games that hash `IMEI + MAC` into a device id a per-device value instead of the empty IMEI / masked MAC of Android 10+ |
 | `tools/jiagu_run/` | Runs a 32-bit library, for example a packer stub such as 360 Jiagu, with a fake JNI environment, to study or unpack it without running the app (Linux/WSL host, or the device through `adb shell`; see its README) |
+
+## Building an APK in one command
+
+`tools/build_apk.py` takes a game APK and returns a ready one, with the options used for every build so far already
+set. It checks the APK and picks the route: `bridge` (32-bit, unpacked: the Lenovo 1.7.x builds), `jiagu` (32-bit,
+packed with 360 Jiagu: the Lenovo 2.x builds) or `native` (already 64-bit: nothing to port).
+
+```sh
+python tools/build_apk.py pvz2c_lenovo_2.1.1_815.apk -o ready.apk
+python tools/build_apk.py pvz2c_lenovo_1.7.7_748.apk -o ready.apk --server 192.168.1.10 --install
+```
+
+What it does, in order: builds the bridges with the NDK (cached in `~/.a32bridge/`, rebuilt when `src/` changes),
+decodes with apktool, runs `port_apk.py`, rebuilds with `apktool b -api 28`, aligns and signs; for a Jiagu game it first
+runs the packer library through `tools/jiagu_run` (WSL on Windows) to get the decrypted dex files and ends with
+`port_apk.py finish`. `--server` then runs the private server repo's `patch_apk.py` on the result (`--server-tools` or
+`PVZ2C_SERVER_TOOLS` names its folder), and `--install` pushes it with `adb install -r`.
+
+Defaults, each with a `--no-...` switch: free shop on (`A32_FREE_SHOP`: purchases complete without the payment SDK),
+bridge log on (`A32_LOG`), the x86_64 bridge included, empty placeholder libraries under the names of the 32-bit SDK
+libraries (`tools/mod_stub.c`), and for Jiagu games `--unhollow` and the extra dex files shipped as
+`lib/<abi>/liba32dex<N>.so` (`--dex-in-lib`, Android 8+). The bridge answers signature checks with its default hash
+(the Lenovo builds pass with it); `--sig-hash` sets another. `--lib-name` overrides the game library name, which is the
+largest 32-bit library in the APK.
+
+Tools: `java` and `keytool` (PATH or `JAVA_HOME`), `apktool` (PATH, or `APKTOOL=<apktool.jar>`), Android build-tools
+(`zipalign`, `apksigner`; PATH or `ANDROID_HOME`), the NDK (`ANDROID_NDK` or `ANDROID_HOME/ndk`), `cmake` and `ninja`,
+and for Jiagu games WSL with `g++`, `cmake` and `ninja`. The extra dex files are decoded with the copy of baksmali that
+apktool carries, so no separate baksmali jar is needed. The signing key is a debug keystore created in `~/.a32bridge/`.
+
+Lenovo builds that have been through it (package `com.popcap.pvz2cthdlx`): 1.7.5 and 1.7.7 (1.7.7 runs on a phone
+through to the map with the daily sign-in working), 2.1.1 (builds; same files as the earlier hand-made port), 2.4.0
+(builds and verifies). The earlier hand-made ports of 2.2.1, 2.2.7, 2.2.8 and 2.3.9 reached the game on an emulator;
+`JIAGU_HANDOFF.md` lists what is known per version.
 
 ## Debugging
 

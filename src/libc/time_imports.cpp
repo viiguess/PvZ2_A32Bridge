@@ -139,6 +139,19 @@ static void import_strftime(Ctx& ctx, const Stub&) {
   ctx.ret((u32)strftime((char*)ctx.p(0), ctx.a(1), (const char*)ctx.p(2), &calendar));
 }
 
+static void import_strptime(Ctx& ctx, const Stub&) {  // (const char* s, const char* format, struct tm*)
+  struct tm calendar;
+  tm_from_guest(ctx.a(2), &calendar);
+  const char* input = (const char*)ctx.p(0);
+  const char* end = strptime(input, (const char*)ctx.p(1), &calendar);
+  if (!end) {
+    ctx.ret(0);
+    return;
+  }
+  tm_to_guest(&calendar, ctx.a(2));
+  ctx.ret(ctx.a(0) + (u32)(end - input));
+}
+
 static void import_asctime(Ctx& ctx, const Stub&) {
   static u32 buf = gdata_alloc(32, 4);
   struct tm calendar;
@@ -185,6 +198,7 @@ void register_time_imports() {
   hle("mktime", import_mktime);
   hle("ctime", import_ctime);
   hle("strftime", import_strftime);
+  hle("strptime", import_strptime);
   hle("asctime", import_asctime);
   hle("wcsftime", import_wcsftime);
 }

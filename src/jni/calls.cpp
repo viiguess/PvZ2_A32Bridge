@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -249,6 +250,34 @@ static void do_call(Ctx& ctx, int kind, int source, int return_type, bool is_new
     ctx.ret(spare ? href(spare, REF_LOCAL) : 0);
     return;
   }
+  // The game polls the carrier type from its render thread while a purchase is open. Every Java call reads the SIM
+  // identifiers through reflection and Binder, so the first answer is kept for the rest of the run.
+  if (!is_new && method.name == "Diag_GetMobileCardType" && method.sig.compare(0, 2, "()") == 0 &&
+      (return_type == T_INT || return_type == T_OBJECT)) {
+    static std::mutex cache_mu;
+    static bool cached = false;
+    static jint cached_int = 0;
+    static jobject cached_object = nullptr;
+    std::lock_guard<std::mutex> lock(cache_mu);
+    if (!cached) {
+      jvalue none[1];
+      memset(none, 0, sizeof none);
+      if (return_type == T_INT) {
+        cached_int = kind == CALL_VIRTUAL ? jni->CallIntMethodA(obj, method.m, none) : jni->CallStaticIntMethodA(cls, method.m, none);
+      } else {
+        jobject local = kind == CALL_VIRTUAL ? jni->CallObjectMethodA(obj, method.m, none) : jni->CallStaticObjectMethodA(cls, method.m, none);
+        cached_object = local && !jni->ExceptionCheck() ? jni->NewGlobalRef(local) : nullptr;
+      }
+      if (jni->ExceptionCheck())
+        jni->ExceptionClear();
+      cached = true;
+    }
+    if (return_type == T_INT)
+      ctx.ret((u32)cached_int);
+    else
+      ctx.ret(cached_object ? href(jni->NewLocalRef(cached_object), REF_LOCAL) : 0);
+    return;
+  }
   t_last_call = method.name + method.sig;
   ArgReader reader{&ctx, arg_index, 0, source};
   if (source != ARGS_VARIADIC)
@@ -329,6 +358,19 @@ static void do_call(Ctx& ctx, int kind, int source, int return_type, bool is_new
     LOG("JNI exception after %s%s (cleared)", method.name.c_str(), method.sig.c_str());
     jni->ExceptionDescribe();
     jni->ExceptionClear();
+    // Telephony identifiers throw on modern Android. Old packers read the result without a null check, so an
+    // IMEI-shaped string stands in for it.
+    static const char* const identifier_getters[] = {"getDeviceId", "getImei", "getMeid", "getSubscriberId",
+                                                     "getSimSerialNumber", "getLine1Number"};
+    static const char kStringReturn[] = ")Ljava/lang/String;";
+    size_t tail = sizeof kStringReturn - 1;
+    if (return_type == T_OBJECT && method.sig.size() >= tail &&
+        method.sig.compare(method.sig.size() - tail, tail, kStringReturn) == 0)
+      for (const char* getter : identifier_getters)
+        if (method.name == getter) {
+          ctx.ret(href(jni->NewStringUTF("358240051111110"), REF_LOCAL));
+          break;
+        }
   }
 }
 

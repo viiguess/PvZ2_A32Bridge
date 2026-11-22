@@ -5,6 +5,7 @@
 #pragma once
 
 #include <android/log.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,7 +13,35 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 
 // Logging is compiled out unless built with -DA32_LOG (translator messages and the game's own log/stdio output).
-#ifdef A32_LOG
+#ifdef A32_TRACE
+// Trace builds also append every message to a file in the app's data folder, which logcat throttling cannot drop.
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+static inline void a32_file_log(const char* format, ...) __attribute__((format(printf, 1, 2)));
+static inline void a32_file_log(const char* format, ...) {
+  static FILE* file = [] {
+    char name[128] = {};
+    if (FILE* c = fopen("/proc/self/cmdline", "r")) {
+      if (!fgets(name, sizeof name, c))
+        name[0] = 0;
+      fclose(c);
+    }
+    char path[256];
+    snprintf(path, sizeof path, "/data/data/%s/a32_trace.log", name);
+    return fopen(path, "w");
+  }();
+  if (!file)
+    return;
+  va_list args;
+  va_start(args, format);
+  vfprintf(file, format, args);
+  va_end(args);
+  fputc(10, file);
+  fflush(file);
+}
+#define LOG(...) (__android_log_print(ANDROID_LOG_INFO, "a32", __VA_ARGS__), a32_file_log(__VA_ARGS__))
+#elif defined(A32_LOG)
 #define LOG(...) __android_log_print(ANDROID_LOG_INFO, "a32", __VA_ARGS__)
 #else
 #define LOG(...) ((void)0)

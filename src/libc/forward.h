@@ -2,7 +2,8 @@
 // implementation found with dlsym.
 //
 // A signature is "<args>><return>", one letter per argument:
-//   p  guest pointer -> host pointer            o  pointer-or-GL-offset (values below GUEST_MIN_POINTER pass through)
+//   p  guest pointer -> host pointer            s  guest path string -> host path (see guest_host_path)
+//   o  pointer-or-GL-offset (values below GUEST_MIN_POINTER pass through)
 //   F  guest FILE* -> host FILE*                i  s32      u  u32      q  64-bit (aligned register pair)
 //   f  float                                    d  double
 // Return letters: v void, i/u 32-bit, q 64-bit, f, d, P host pointer -> guest pointer, F host FILE* -> guest FILE*.

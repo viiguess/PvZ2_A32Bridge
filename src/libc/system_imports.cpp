@@ -100,7 +100,7 @@ static void import_pread(Ctx& ctx, const Stub&) {  // bionic's 32-bit pread take
 }
 
 static void import_remove(Ctx& ctx, const Stub&) {
-  ctx.ret((u32)remove((const char*)ctx.p(0)));
+  ctx.ret((u32)remove(guest_host_path((const char*)ctx.p(0))));
 }
 
 static void import_lseek64(Ctx& ctx, const Stub&) {  // (fd, offset in r2:r3, whence on the stack) -> 64-bit result

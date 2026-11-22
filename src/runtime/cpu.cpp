@@ -5,7 +5,12 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
+#include <map>
+#include <thread>
+#include <unistd.h>
 #include <mutex>
+#include <string>
 #include <vector>
 
 #include "dynarmic/interface/exclusive_monitor.h"
@@ -27,6 +32,63 @@ static size_t g_next_pid;
 
 enum { MAX_JITS = 512 };
 
+// Guest PC sampler. When a32_prof exists in the game's external files folder, a host thread halts every running JIT at a fixed
+// interval; the interrupted guest pc and lr are counted and the top entries are written to
+// a32_prof.txt next to it every few seconds.
+static std::mutex g_prof_mu;
+static std::map<u32, u32> g_prof_pc, g_prof_lr;
+static std::atomic<bool> g_prof_on{false};
+
+static std::string prof_path(const char* name) {
+  char pkg[128] = {};
+  FILE* c = fopen("/proc/self/cmdline", "r");
+  if (c) {
+    if (!fgets(pkg, sizeof pkg, c))
+      pkg[0] = 0;
+    fclose(c);
+  }
+  return std::string("/storage/emulated/0/Android/data/") + pkg + "/files/" + name;
+}
+
+static void prof_write() {
+  std::lock_guard<std::mutex> lock(g_prof_mu);
+  FILE* f = fopen(prof_path("a32_prof.txt").c_str(), "w");
+  if (!f)
+    return;
+  for (auto* hist : {&g_prof_pc, &g_prof_lr}) {
+    std::vector<std::pair<u32, u32>> v(hist->begin(), hist->end());
+    std::sort(v.begin(), v.end(), [](auto& a, auto& b) { return a.second > b.second; });
+    fputs(hist == &g_prof_pc ? "# pc\n" : "# lr\n", f);
+    for (size_t i = 0; i < v.size() && i < 120; i++)
+      fprintf(f, "%08x %u\n", v[i].first, v[i].second);
+  }
+  fclose(f);
+}
+
+static void prof_start() {
+  static std::once_flag once;
+  std::call_once(once, [] {
+    if (access(prof_path("a32_prof").c_str(), F_OK) != 0)
+      return;
+    g_prof_on = true;
+    std::thread([] {
+      int ticks = 0;
+      for (;;) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        {
+          std::lock_guard<std::mutex> lock(g_cpu_mu);
+          for (Cpu* cpu : g_all_cpus)
+            if (cpu->thr->running == cpu)
+              cpu->jit->HaltExecution(Dynarmic::HaltReason::UserDefined2);
+        }
+        if (++ticks % 600 == 0)
+          prof_write();
+      }
+    }).detach();
+  });
+}
+
+
 Cpu::Cpu(Thread* thr, int depth) : thr(thr) {
   static std::once_flag once;
   std::call_once(once, [] {
@@ -43,9 +105,10 @@ Cpu::Cpu(Thread* thr, int depth) : thr(thr) {
     if (!g_free_pid.empty()) {
       pid = g_free_pid.back();
       g_free_pid.pop_back();
-    } else if (g_next_pid < MAX_JITS)
+    } else if (g_next_pid < MAX_JITS) {
       pid = g_next_pid++;
-    else {
+      g_mon->SetActiveProcessors(g_next_pid);  // the monitor scan covers only ids that exist
+    } else {
       LOG("too many JIT instances");
       abort();
     }
@@ -72,8 +135,10 @@ Cpu::Cpu(Thread* thr, int depth) : thr(thr) {
                        Dynarmic::OptimizationFlag::Unsafe_InaccurateNaN |
                        Dynarmic::OptimizationFlag::Unsafe_IgnoreStandardFPCRValue;
   jit = new Dynarmic::A32::Jit(conf);
-  std::lock_guard<std::mutex> lock(g_cpu_mu);
-  g_all_cpus.push_back(this);
+  {
+    std::lock_guard<std::mutex> lock(g_cpu_mu);
+    g_all_cpus.push_back(this);
+  }
 }
 
 void cpu_invalidate_range(u32 start, u32 size) {
@@ -84,9 +149,12 @@ void cpu_invalidate_range(u32 start, u32 size) {
 }
 
 Cpu::~Cpu() {
+  {
+    std::lock_guard<std::mutex> lock(g_cpu_mu);
+    g_all_cpus.erase(std::find(g_all_cpus.begin(), g_all_cpus.end(), this));
+  }
   delete jit;
   std::lock_guard<std::mutex> lock(g_cpu_mu);
-  g_all_cpus.erase(std::find(g_all_cpus.begin(), g_all_cpus.end(), this));
   g_free_pid.push_back(pid);
 }
 
@@ -131,10 +199,20 @@ u32 guest_callv(u32 pc, const u32* args, int arg_count, u32* high_word) {
   thr->running = cpu;
   thr->sp_hint = sp;
   Dynarmic::HaltReason reason;
-  do  // a cache invalidation halts the JIT mid-call: resume
+  prof_start();
+  for (;;) {  // a cache invalidation or a profiler tick halts the JIT mid-call: resume
     reason = cpu->jit->Run();
-  while (Dynarmic::Has(reason, Dynarmic::HaltReason::CacheInvalidation) &&
-         !Dynarmic::Has(reason, Dynarmic::HaltReason::UserDefined1) && !cpu->fault);
+    if (Dynarmic::Has(reason, Dynarmic::HaltReason::UserDefined1) || cpu->fault)
+      break;
+    if (g_prof_on && Dynarmic::Has(reason, Dynarmic::HaltReason::UserDefined2)) {
+      std::lock_guard<std::mutex> lock(g_prof_mu);
+      g_prof_pc[regs[15] & ~1u]++;
+      g_prof_lr[regs[14] & ~1u]++;
+      continue;
+    }
+    if (!Dynarmic::Has(reason, Dynarmic::HaltReason::CacheInvalidation))
+      break;
+  }
   if (cpu->fault && !thr->exit_req)
     LOG("guest fault at pc=%08x entry=%08x", regs[15], pc);
   u32 out0 = regs[0], out1 = regs[1];

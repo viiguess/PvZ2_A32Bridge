@@ -76,6 +76,10 @@ static void new_primitive_array(Ctx& ctx, const Stub& stub) {
 static void get_array_region(Ctx& ctx, const Stub& stub) {
   JNIEnv* jni = env();
   jarray array = (jarray)hobj(ctx.a(1));
+  if (!array) {  // the Java side released the array while a worker thread was still using it; ART aborts on a null array
+    LOG("%s(null) after %s", "GetArrayRegion", t_last_call.c_str());
+    return;
+  }
   jsize start = ctx.a(2), length = ctx.a(3);
   void* buffer = ctx.p(4);
   switch ((int)(intptr_t)stub.fn) {
@@ -109,6 +113,10 @@ static void get_array_region(Ctx& ctx, const Stub& stub) {
 static void set_array_region(Ctx& ctx, const Stub& stub) {
   JNIEnv* jni = env();
   jarray array = (jarray)hobj(ctx.a(1));
+  if (!array) {  // the Java side released the array while a worker thread was still using it; ART aborts on a null array
+    LOG("%s(null) after %s", "SetArrayRegion", t_last_call.c_str());
+    return;
+  }
   jsize start = ctx.a(2), length = ctx.a(3);
   const void* buffer = ctx.p(4);
   switch ((int)(intptr_t)stub.fn) {
@@ -143,6 +151,11 @@ static void set_array_region(Ctx& ctx, const Stub& stub) {
 static void get_array_elements(Ctx& ctx, const Stub& stub) {
   int type = (int)(intptr_t)stub.fn;
   jarray array = (jarray)hobj(ctx.a(1));
+  if (!array) {  // null array: hand back an empty buffer instead of letting ART abort
+    LOG("Get<T>ArrayElements(null) after %s", t_last_call.c_str());
+    ctx.ret(gmalloc(8));
+    return;
+  }
   jsize length = env()->GetArrayLength(array);
   u32 guest_buffer = gmalloc(length * ELEMENT_SIZE[type] + 8);
   JNIEnv* jni = env();
@@ -181,6 +194,7 @@ static void release_array_elements(Ctx& ctx, const Stub& stub) {
   int type = (int)(intptr_t)stub.fn;
   jarray array = (jarray)hobj(ctx.a(1));
   u32 guest_buffer = ctx.a(2), mode = ctx.a(3);
+  if (!array) return;
   JNIEnv* jni = env();
   jsize length = jni->GetArrayLength(array);
   if (mode != 2 /*JNI_ABORT*/) {
